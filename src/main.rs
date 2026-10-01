@@ -84,6 +84,12 @@ impl Engine {
                     sailfish2::search::FEAT.store(v, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            // ニューラルネットワークの評価関数ファイル（開発用の隠しオプション。Feat に 32 を足すと使う）
+            "EvalFile" => {
+                if let Err(e) = sailfish2::nn::load_global(&value) {
+                    println!("info string EvalFile を読み込めません: {}", e);
+                }
+            }
             "MultiPV" => {
                 if let Ok(v) = value.parse::<usize>() {
                     self.multipv = v.clamp(1, 10);

@@ -2,6 +2,7 @@
 //! 置換表・キラー・ヒストリー・ヌルムーブ・LMR・王手延長を使用。
 
 use crate::eval::{evaluate, PIECE_VALUE};
+use crate::nn::{self, Acc, Network};
 use crate::position::{MoveList, Position, MAX_MOVES};
 use crate::tt::*;
 use crate::types::*;
@@ -21,6 +22,8 @@ pub const F_IMPROVING: u32 = 4;
 pub const F_NULL2: u32 = 8;
 /// 評価値を局面ごとに覚えておく（同じ局面を何度も評価しない）
 pub const F_ECACHE: u32 = 16;
+/// 手作りの評価関数のかわりに、ニューラルネットワーク（EvalFile で読み込んだもの）で評価する
+pub const F_NN: u32 = 32;
 
 const ECACHE_BITS: usize = 18;
 
@@ -96,6 +99,10 @@ pub struct Searcher {
     static_evals: [i32; MAX_PLY + 2],
     /// 評価値のキャッシュ（局面のキー, 評価値）。スレッドごとに持つ。
     ecache: Vec<(u64, i32)>,
+    /// ニューラルネットワーク（F_NN が有効で、読み込み済みのとき）
+    nn: Option<Arc<Network>>,
+    /// 各 ply の局面に対応するアキュムレータ（nn があるときだけ使う）
+    accs: Vec<Acc>,
     root_excluded: Vec<Move>,
     nodes: u64,
     stopped: bool,
@@ -160,6 +167,8 @@ impl Searcher {
             feat: 0,
             static_evals: [-INF; MAX_PLY + 2],
             ecache: vec![(0, 0); 1 << ECACHE_BITS],
+            nn: None,
+            accs: Vec::new(),
             root_excluded: Vec::new(),
             nodes: 0,
             stopped: false,
@@ -184,7 +193,10 @@ impl Searcher {
 
     /// 静的評価（F_ECACHE が有効なら、同じ局面の評価値を覚えておく）
     #[inline]
-    fn eval(&mut self, pos: &Position) -> i32 {
+    fn eval(&mut self, pos: &Position, ply: usize) -> i32 {
+        if let Some(nn) = &self.nn {
+            return nn.forward(&self.accs[ply], pos);
+        }
         if self.feat & F_ECACHE == 0 {
             return evaluate(pos);
         }
@@ -204,7 +216,34 @@ impl Searcher {
         h.limits = self.limits;
         h.helper_idx = idx;
         h.feat = self.feat;
+        h.set_network(self.nn.clone());
         h
+    }
+
+    /// ニューラルネットワークを使う設定にする（None なら手作りの評価関数）
+    fn set_network(&mut self, nn: Option<Arc<Network>>) {
+        if nn.is_some() && self.accs.len() != MAX_PLY + 2 {
+            self.accs = vec![Acc::default(); MAX_PLY + 2];
+        }
+        self.nn = nn;
+    }
+
+    /// 手 m を指す前に、子の局面のアキュムレータを作る
+    #[inline]
+    fn push_acc(&mut self, pos: &Position, m: Move, ply: usize) {
+        if let Some(nn) = &self.nn {
+            let (a, b) = self.accs.split_at_mut(ply + 1);
+            nn.apply(&a[ply], pos, m, &mut b[0]);
+        }
+    }
+
+    /// null move のあとは駒の配置が変わらないので、アキュムレータはそのまま写す
+    #[inline]
+    fn push_acc_null(&mut self, ply: usize) {
+        if self.nn.is_some() {
+            let (a, b) = self.accs.split_at_mut(ply + 1);
+            b[0].clone_from(&a[ply]);
+        }
     }
 
     #[inline]
@@ -246,6 +285,7 @@ impl Searcher {
         self.shared.nodes.store(0, Ordering::Relaxed);
         self.shared.helpers_stop.store(false, Ordering::Relaxed);
         self.feat = FEAT.load(Ordering::Relaxed);
+        self.set_network(if self.feat & F_NN != 0 { nn::global() } else { None });
         self.history.iter_mut().for_each(|h| *h /= 4);
 
         let root_moves = pos.legal_moves();
@@ -288,6 +328,9 @@ impl Searcher {
         self.stopped = false;
         self.killers = [[MOVE_NONE; 2]; MAX_PLY + 2];
         let is_main = self.helper_idx == 0;
+        if let Some(nn) = &self.nn {
+            nn.refresh(pos, &mut self.accs[0]);
+        }
 
         let mut best = root_moves[0];
         let mut ponder = MOVE_NONE;
@@ -495,7 +538,7 @@ impl Searcher {
             }
         }
         if ply >= MAX_PLY - 4 {
-            return self.eval(pos);
+            return self.eval(pos, ply);
         }
 
         let key = pos.key;
@@ -514,7 +557,7 @@ impl Searcher {
         }
 
         let in_check = pos.in_check();
-        let static_eval = if in_check { -INF } else { self.eval(pos) };
+        let static_eval = if in_check { -INF } else { self.eval(pos, ply) };
         self.static_evals[ply] = static_eval;
         // 2 手前（自分の手番）より評価値が良くなっているか（わからないときは良くなっている扱い）
         let imp_on = self.feat & F_IMPROVING != 0;
@@ -538,6 +581,7 @@ impl Searcher {
                 } else {
                     2 + depth / 4
                 };
+                self.push_acc_null(ply);
                 pos.do_null();
                 let s = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, false);
                 pos.undo_null();
@@ -580,6 +624,7 @@ impl Searcher {
             if ply == 0 && self.root_excluded.contains(&m) {
                 continue;
             }
+            self.push_acc(pos, m, ply);
             if !pos.do_move_legal(m) {
                 continue;
             }
@@ -693,7 +738,7 @@ impl Searcher {
         }
         self.sel_depth = self.sel_depth.max(ply);
         if ply >= MAX_PLY - 4 {
-            return self.eval(pos);
+            return self.eval(pos, ply);
         }
 
         let orig_alpha = alpha;
@@ -724,7 +769,7 @@ impl Searcher {
             best = -INF;
             pos.gen_moves(&mut list, false);
         } else {
-            let stand = self.eval(pos);
+            let stand = self.eval(pos, ply);
             if stand >= beta {
                 return stand;
             }
@@ -750,6 +795,7 @@ impl Searcher {
                     continue;
                 }
             }
+            self.push_acc(pos, m, ply);
             if !pos.do_move_legal(m) {
                 continue;
             }
