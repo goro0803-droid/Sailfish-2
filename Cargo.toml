@@ -1,0 +1,15 @@
+[package]
+name = "sailfish2"
+version = "2.0.0-dev"
+authors = ["dax"]
+license = "MIT"
+description = "USI shogi engine"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
