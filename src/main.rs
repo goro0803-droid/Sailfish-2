@@ -100,6 +100,14 @@ impl Engine {
                     self.threads = v.clamp(1, 64);
                 }
             }
+            "UseNeuralNet" => {
+                use sailfish2::search::{F_NN, FEAT};
+                if value.eq_ignore_ascii_case("true") {
+                    FEAT.fetch_or(F_NN, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    FEAT.fetch_and(!F_NN, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             _ => {}
         }
     }
@@ -206,6 +214,9 @@ fn default_threads() -> usize {
 
 fn main() {
     now_us(); // 時計の基準を初期化
+    if let Err(e) = sailfish2::nn::load_default() {
+        eprintln!("埋め込みのネットワークを読み込めません: {}", e);
+    }
     let shared = Arc::new(Shared::new());
     let mut engine = Engine {
         pos: Position::startpos(),
@@ -232,6 +243,7 @@ fn main() {
                 println!("option name NetworkDelay type spin default 120 min 0 max 10000");
                 println!("option name MultiPV type spin default 1 min 1 max 10");
                 println!("option name Threads type spin default {} min 1 max 64", default_threads());
+                println!("option name UseNeuralNet type check default true");
                 println!("usiok");
             }
             "setoption" => engine.setoption(&tokens),
@@ -266,6 +278,56 @@ fn main() {
             // ---- デバッグ用コマンド ----
             "d" => print!("{}", engine.pos.display()),
             "eval" => println!("eval = {}", eval::evaluate(&engine.pos)),
+            // 評価の速さの計測: evalbench [回数]（今の局面で、手作りの評価・ネットワークの出力・差分更新の 1 回あたりの時間を出す）
+            "evalbench" => {
+                use std::time::Instant;
+                let n: usize = tokens.get(1).and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+                let pos = engine.pos.clone();
+                let mut sink = 0i64;
+                let t = Instant::now();
+                for _ in 0..n {
+                    sink += eval::evaluate(std::hint::black_box(&pos)) as i64;
+                }
+                println!("手作りの評価    {:6.1} ns/回", t.elapsed().as_nanos() as f64 / n as f64);
+                if let Some(net) = sailfish2::nn::global() {
+                    let mut acc = sailfish2::nn::Acc::default();
+                    net.refresh(&pos, &mut acc);
+                    let t = Instant::now();
+                    for _ in 0..n {
+                        sink += (net.forward_raw(std::hint::black_box(&acc), pos.side) * 1000.0) as i64;
+                    }
+                    println!("ネットワークの出力 {:6.1} ns/回", t.elapsed().as_nanos() as f64 / n as f64);
+                    // 指したあとの局面を先に作っておき、差分更新だけを測る
+                    let mut p2 = pos.clone();
+                    let moves = p2.legal_moves();
+                    let after: Vec<(Position, Move, u8)> = moves
+                        .iter()
+                        .map(|&m| {
+                            let cap = if mv_is_drop(m) { 0 } else { pos.board[mv_to(m)] };
+                            let mut q = pos.clone();
+                            q.do_move(m);
+                            (q, m, cap)
+                        })
+                        .collect();
+                    let mut next = sailfish2::nn::Acc::default();
+                    let t = Instant::now();
+                    let rounds = (n / moves.len().max(1)).max(1);
+                    for _ in 0..rounds {
+                        for (q, m, cap) in &after {
+                            net.apply_after(std::hint::black_box(&acc), q, *m, *cap, &mut next);
+                            sink += next.mat as i64;
+                        }
+                    }
+                    println!("差分更新（1 手）  {:6.1} ns/回", t.elapsed().as_nanos() as f64 / (rounds * moves.len().max(1)) as f64);
+                    let t = Instant::now();
+                    for _ in 0..(n / 20).max(1) {
+                        net.refresh(std::hint::black_box(&pos), &mut acc);
+                        sink += acc.mat as i64;
+                    }
+                    println!("作り直し         {:6.1} ns/回", t.elapsed().as_nanos() as f64 / (n / 20).max(1) as f64);
+                }
+                let _ = sink;
+            }
             "moves" => {
                 let ms: Vec<String> = engine.pos.legal_moves().iter().map(|&m| move_to_usi(m)).collect();
                 println!("{} moves: {}", ms.len(), ms.join(" "));

@@ -29,9 +29,19 @@ const HAND_START: [usize; 8] = [0, 0, 18, 22, 26, 30, 32, 34];
 /// 片方の持ち主の持ち駒の特徴の数
 const HAND_PER_OWNER: usize = 38;
 const N_HAND: usize = 2 * HAND_PER_OWNER;
-/// 玉からの相対位置の特徴: クラス（玉を除く駒種 13 × 持ち主 2）× 相対位置（17 × 17）
+/// 玉からの相対位置の範囲（筋・段それぞれ ±KR_R まで。これより遠い駒には玉との位置関係の特徴を付けない）
+#[cfg(feature = "kr2")]
+const KR_R: i32 = 2;
+#[cfg(feature = "kr4")]
+const KR_R: i32 = 4;
+#[cfg(feature = "kr8")]
+const KR_R: i32 = 8;
+#[cfg(not(any(feature = "kr2", feature = "kr4", feature = "kr8")))]
+const KR_R: i32 = 3;
+const KR_W: usize = (2 * KR_R + 1) as usize;
+/// 玉からの相対位置の特徴: クラス（玉を除く駒種 13 × 持ち主 2）× 相対位置（KR_W × KR_W）
 const KR_CLASSES: usize = 26;
-const KR_OFFS: usize = 17 * 17;
+const KR_OFFS: usize = KR_W * KR_W;
 const KR_BLOCK: usize = KR_CLASSES * KR_OFFS;
 const KR_BASE: usize = N_PS + N_HAND;
 /// 特徴の総数（自玉基準のブロックと敵玉基準のブロックがある）
@@ -59,16 +69,20 @@ fn ps_feat(persp: usize, color: usize, pt: u8, sq: usize) -> usize {
     (rel_color * 14 + (pt as usize - 1)) * 81 + rel_sq
 }
 
-/// 玉 king_sq からの相対位置の特徴番号（enemy_ref が true なら敵玉基準のブロック）
+/// 玉 king_sq からの相対位置の特徴番号（enemy_ref が true なら敵玉基準のブロック）。範囲外なら None
 #[inline]
-fn kr_feat(persp: usize, color: usize, pt: u8, sq: usize, king_sq: usize, enemy_ref: bool) -> usize {
+fn kr_feat(persp: usize, color: usize, pt: u8, sq: usize, king_sq: usize, enemy_ref: bool) -> Option<usize> {
+    let (pf, pr) = rel_coords(persp, sq);
+    let (kf, kr) = rel_coords(persp, king_sq);
+    let (dx, dy) = (pf - kf, pr - kr);
+    if dx.abs() > KR_R || dy.abs() > KR_R {
+        return None;
+    }
     let rel_color = (color != persp) as usize;
     let kt = pt as usize - 1 - (pt > KING) as usize; // 玉を除いた駒種 0..12
     let class = rel_color * 13 + kt;
-    let (pf, pr) = rel_coords(persp, sq);
-    let (kf, kr) = rel_coords(persp, king_sq);
-    let off = ((pf - kf + 8) * 17 + (pr - kr + 8)) as usize;
-    KR_BASE + (enemy_ref as usize) * KR_BLOCK + class * KR_OFFS + off
+    let off = ((dx + KR_R) as usize) * KR_W + (dy + KR_R) as usize;
+    Some(KR_BASE + (enemy_ref as usize) * KR_BLOCK + class * KR_OFFS + off)
 }
 
 /// 視点 persp から見た、持ち駒の特徴番号（k は 1 始まりの枚数目）
@@ -85,12 +99,16 @@ fn piece_feats(persp: usize, color: usize, pt: u8, sq: usize, kings: [usize; 2],
     let mut n = 1;
     if pt != KING {
         if kings[persp] != NO_SQ {
-            out[n] = kr_feat(persp, color, pt, sq, kings[persp], false);
-            n += 1;
+            if let Some(f) = kr_feat(persp, color, pt, sq, kings[persp], false) {
+                out[n] = f;
+                n += 1;
+            }
         }
         if kings[persp ^ 1] != NO_SQ {
-            out[n] = kr_feat(persp, color, pt, sq, kings[persp ^ 1], true);
-            n += 1;
+            if let Some(f) = kr_feat(persp, color, pt, sq, kings[persp ^ 1], true) {
+                out[n] = f;
+                n += 1;
+            }
         }
     }
     n
@@ -107,8 +125,8 @@ pub fn mirror_feature(f: usize) -> usize {
         let g = f - KR_BASE;
         let (blk, r) = (g / KR_BLOCK, g % KR_BLOCK);
         let (cls, off) = (r / KR_OFFS, r % KR_OFFS);
-        let (dx, dy) = (off / 17, off % 17);
-        KR_BASE + blk * KR_BLOCK + cls * KR_OFFS + (16 - dx) * 17 + dy
+        let (dx, dy) = (off / KR_W, off % KR_W);
+        KR_BASE + blk * KR_BLOCK + cls * KR_OFFS + (KR_W - 1 - dx) * KR_W + dy
     }
 }
 
@@ -283,23 +301,14 @@ impl Network {
         }
     }
 
-    /// 手 m を指す前の局面 pos とそのアキュムレータ from から、指したあとのアキュムレータ to を作る
-    pub fn apply(&self, from: &Acc, pos: &Position, m: Move, to: &mut Acc) {
-        let us = pos.side;
+    /// 手 m を指したあとの局面 pos と、指す前のアキュムレータ from から、指したあとのアキュムレータ to を作る。
+    /// cap は m で取った駒（取らなければ 0）。指したあとの盤からは取った駒がわからないので、別に渡す。
+    pub fn apply_after(&self, from: &Acc, pos: &Position, m: Move, cap: u8, to: &mut Acc) {
+        let us = pos.side ^ 1; // 指した側
         let dst = mv_to(m);
         // 玉が動くと、玉からの相対位置の特徴がすべて変わるので、作り直す（玉の移動は少ない）
-        if !mv_is_drop(m) && type_of(pos.board[mv_from(m)]) == KING {
-            let mut board = pos.board;
-            let mut hand = pos.hand;
-            let cap = board[dst];
-            if cap != 0 {
-                hand[us][unpromote(type_of(cap)) as usize] += 1;
-            }
-            board[dst] = board[mv_from(m)];
-            board[mv_from(m)] = 0;
-            let mut kings = pos.king;
-            kings[us] = dst;
-            self.refresh_arrays(&board, &hand, kings, to);
+        if !mv_is_drop(m) && type_of(pos.board[dst]) == KING {
+            self.refresh_arrays(&pos.board, &pos.hand, pos.king, to);
             return;
         }
         to.clone_from(from);
@@ -307,28 +316,26 @@ impl Network {
         let sign = if us == BLACK { 1 } else { -1 };
         if mv_is_drop(m) {
             let pt = mv_drop_pt(m);
-            let n = (pos.hand[us][pt as usize] as usize).min(HAND_CAP[pt as usize]);
-            if n >= 1 {
-                for persp in 0..2 {
-                    self.sub(to, persp, hand_feat(persp, us, pt, n));
-                }
+            // 打つ前の持ち駒の枚数は、打ったあとの枚数 + 1
+            let before = (pos.hand[us][pt as usize] as usize + 1).min(HAND_CAP[pt as usize]);
+            for persp in 0..2 {
+                self.sub(to, persp, hand_feat(persp, us, pt, before));
             }
             self.piece(to, true, us, pt, dst, kings);
             to.mat += sign * (PIECE_VALUE[pt as usize] - HAND_VALUE[pt as usize]);
         } else {
             let src = mv_from(m);
-            let p = pos.board[src];
-            let pt = type_of(p);
-            let npt = if mv_is_promo(m) { pt + PROMOTE } else { pt };
+            let npt = type_of(pos.board[dst]); // 指したあとの駒種（成っていれば成り駒）
+            let pt = if mv_is_promo(m) { npt - PROMOTE } else { npt };
             self.piece(to, false, us, pt, src, kings);
             self.piece(to, true, us, npt, dst, kings);
             to.mat += sign * (PIECE_VALUE[npt as usize] - PIECE_VALUE[pt as usize]);
-            let cap = pos.board[dst];
             if cap != 0 {
                 let cpt = type_of(cap);
                 self.piece(to, false, color_of(cap), cpt, dst, kings);
                 let hpt = unpromote(cpt);
-                let n = (pos.hand[us][hpt as usize] as usize + 1).min(HAND_CAP[hpt as usize]);
+                // 取ったあとの持ち駒の枚数
+                let n = (pos.hand[us][hpt as usize] as usize).min(HAND_CAP[hpt as usize]);
                 for persp in 0..2 {
                     self.add(to, persp, hand_feat(persp, us, hpt, n));
                 }
@@ -337,9 +344,9 @@ impl Network {
         }
     }
 
-    /// 局面 pos（手番側から見た）の評価値（cp）。acc は pos に対応するアキュムレータ。
-    pub fn forward(&self, acc: &Acc, pos: &Position) -> i32 {
-        let stm = pos.side;
+    /// ネットワークの出力（土台を足す前、-1〜1 くらいの値）
+    #[inline]
+    pub fn forward_raw(&self, acc: &Acc, stm: usize) -> f32 {
         let mut x = [0f32; 2 * H];
         for i in 0..H {
             x[i] = acc.v[stm][i].clamp(0.0, 1.0);
@@ -350,6 +357,13 @@ impl Network {
             let z = self.b2[j] + dot(&self.w2[j * 2 * H..(j + 1) * 2 * H], &x);
             out += self.w3[j] * z.clamp(0.0, 1.0);
         }
+        out
+    }
+
+    /// 局面 pos（手番側から見た）の評価値（cp）。acc は pos に対応するアキュムレータ。
+    pub fn forward(&self, acc: &Acc, pos: &Position) -> i32 {
+        let stm = pos.side;
+        let out = self.forward_raw(acc, stm);
         let base = if self.base_hc {
             evaluate(pos)
         } else if stm == BLACK {
@@ -418,10 +432,22 @@ pub fn global() -> Option<Arc<Network>> {
 /// ファイルからネットワークを読み込んで、エンジン全体で使うようにする
 pub fn load_global(path: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path, e))?;
-    let net = Network::from_bytes(&bytes)?;
+    set_global(Network::from_bytes(&bytes)?);
+    Ok(())
+}
+
+fn set_global(net: Network) {
     if let Ok(mut g) = GLOBAL.write() {
         *g = Some(Arc::new(net));
     }
+}
+
+/// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn）
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/default.nn");
+
+/// 埋め込んだ標準のネットワークを読み込んで、エンジン全体で使うようにする
+pub fn load_default() -> Result<(), String> {
+    set_global(Network::from_bytes(DEFAULT_NET)?);
     Ok(())
 }
 
@@ -461,9 +487,10 @@ mod tests {
                         kings += 1;
                     }
                 }
-                let mut next = Acc::default();
-                net.apply(&acc, &pos, m, &mut next);
+                let cap = if mv_is_drop(m) { 0 } else { pos.board[mv_to(m)] };
                 pos.do_move(m);
+                let mut next = Acc::default();
+                net.apply_after(&acc, &pos, m, cap, &mut next);
                 let mut fresh = Acc::default();
                 net.refresh(&pos, &mut fresh);
                 assert_eq!(next.mat, fresh.mat, "駒割りが合わない（{} 手目）", ply);

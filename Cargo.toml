@@ -13,3 +13,9 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+
+[features]
+# 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
+kr2 = []
+kr4 = []
+kr8 = []

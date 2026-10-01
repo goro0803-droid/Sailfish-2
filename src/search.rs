@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// 探索の改良を個別に入れ替えるためのビット（USI の隠しオプション Feat で指定。強さの比較用）
-pub static FEAT: AtomicU32 = AtomicU32::new(F_QS_TT);
+pub static FEAT: AtomicU32 = AtomicU32::new(F_QS_TT | F_NN);
 /// 静止探索でも置換表を使う
 pub const F_QS_TT: u32 = 1;
 /// 置換表に手がないとき、深さを 1 減らす（Internal Iterative Reduction）
@@ -103,6 +103,8 @@ pub struct Searcher {
     nn: Option<Arc<Network>>,
     /// 各 ply の局面に対応するアキュムレータ（nn があるときだけ使う）
     accs: Vec<Acc>,
+    /// 各 ply の局面に至った手と、そのとき取った駒（アキュムレータの更新待ち）
+    pend: Vec<(Move, u8)>,
     root_excluded: Vec<Move>,
     nodes: u64,
     stopped: bool,
@@ -169,6 +171,7 @@ impl Searcher {
             ecache: vec![(0, 0); 1 << ECACHE_BITS],
             nn: None,
             accs: Vec::new(),
+            pend: Vec::new(),
             root_excluded: Vec::new(),
             nodes: 0,
             stopped: false,
@@ -224,25 +227,44 @@ impl Searcher {
     fn set_network(&mut self, nn: Option<Arc<Network>>) {
         if nn.is_some() && self.accs.len() != MAX_PLY + 2 {
             self.accs = vec![Acc::default(); MAX_PLY + 2];
+            self.pend = vec![(MOVE_NONE, 0); MAX_PLY + 2];
         }
         self.nn = nn;
     }
 
-    /// 手 m を指す前に、子の局面のアキュムレータを作る
+    /// 子の局面の評価に必要な情報（指した手と取った駒）を、指す前に控えておく。
+    /// アキュムレータの更新は、子の局面で評価が必要になったときに ensure_acc で行う
+    /// （枝刈りや違法手で捨てる手のぶんは計算しない）。
     #[inline]
-    fn push_acc(&mut self, pos: &Position, m: Move, ply: usize) {
-        if let Some(nn) = &self.nn {
-            let (a, b) = self.accs.split_at_mut(ply + 1);
-            nn.apply(&a[ply], pos, m, &mut b[0]);
+    fn set_pending(&mut self, pos: &Position, m: Move, ply: usize) {
+        if self.nn.is_some() {
+            let cap = if mv_is_drop(m) { 0 } else { pos.board[mv_to(m)] };
+            self.pend[ply + 1] = (m, cap);
         }
     }
 
-    /// null move のあとは駒の配置が変わらないので、アキュムレータはそのまま写す
+    /// null move のあとは駒の配置が変わらないので、アキュムレータはそのまま写す（MOVE_NONE が目印）
     #[inline]
-    fn push_acc_null(&mut self, ply: usize) {
+    fn set_pending_null(&mut self, ply: usize) {
         if self.nn.is_some() {
-            let (a, b) = self.accs.split_at_mut(ply + 1);
-            b[0].clone_from(&a[ply]);
+            self.pend[ply + 1] = (MOVE_NONE, 0);
+        }
+    }
+
+    /// この ply の局面（pos）のアキュムレータを、一つ前の ply のものと控えておいた手から作る
+    #[inline]
+    fn ensure_acc(&mut self, pos: &Position, ply: usize) {
+        if ply == 0 {
+            return;
+        }
+        if let Some(nn) = &self.nn {
+            let (m, cap) = self.pend[ply];
+            let (a, b) = self.accs.split_at_mut(ply);
+            if m == MOVE_NONE {
+                b[0].clone_from(&a[ply - 1]);
+            } else {
+                nn.apply_after(&a[ply - 1], pos, m, cap, &mut b[0]);
+            }
         }
     }
 
@@ -538,6 +560,7 @@ impl Searcher {
             }
         }
         if ply >= MAX_PLY - 4 {
+            self.ensure_acc(pos, ply);
             return self.eval(pos, ply);
         }
 
@@ -556,6 +579,8 @@ impl Searcher {
             }
         }
 
+        // ここから先でこの局面のアキュムレータが要る（評価と、子の局面への更新の元になる）
+        self.ensure_acc(pos, ply);
         let in_check = pos.in_check();
         let static_eval = if in_check { -INF } else { self.eval(pos, ply) };
         self.static_evals[ply] = static_eval;
@@ -581,7 +606,7 @@ impl Searcher {
                 } else {
                     2 + depth / 4
                 };
-                self.push_acc_null(ply);
+                self.set_pending_null(ply);
                 pos.do_null();
                 let s = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, false);
                 pos.undo_null();
@@ -624,7 +649,7 @@ impl Searcher {
             if ply == 0 && self.root_excluded.contains(&m) {
                 continue;
             }
-            self.push_acc(pos, m, ply);
+            self.set_pending(pos, m, ply);
             if !pos.do_move_legal(m) {
                 continue;
             }
@@ -738,6 +763,7 @@ impl Searcher {
         }
         self.sel_depth = self.sel_depth.max(ply);
         if ply >= MAX_PLY - 4 {
+            self.ensure_acc(pos, ply);
             return self.eval(pos, ply);
         }
 
@@ -761,6 +787,7 @@ impl Searcher {
             }
         }
 
+        self.ensure_acc(pos, ply);
         let in_check = pos.in_check();
         let mut best_move = MOVE_NONE;
         let mut list = MoveList::new();
@@ -795,7 +822,7 @@ impl Searcher {
                     continue;
                 }
             }
-            self.push_acc(pos, m, ply);
+            self.set_pending(pos, m, ply);
             if !pos.do_move_legal(m) {
                 continue;
             }
