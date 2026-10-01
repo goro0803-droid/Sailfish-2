@@ -88,6 +88,23 @@ impl TT {
         }
     }
 
+    /// 静止探索の結果を保存する。同じ局面の通常探索の結果（深さ 1 以上）は上書きしない。
+    #[inline]
+    pub fn store_qs(&self, key: u64, mv: Move, score: i32, flag: u8) {
+        let s = &self.table[key as usize & self.mask];
+        let old_data = s.data.load(Ordering::Relaxed);
+        let same = s.key_xor.load(Ordering::Relaxed) ^ old_data == key;
+        let old = TTEntry::unpack(old_data);
+        if same && old.depth > 0 {
+            return;
+        }
+        let mv = if mv == 0 && same { old.mv } else { mv };
+        let e = TTEntry { mv, score: score as i16, depth: 0, flag };
+        let data = e.pack();
+        s.data.store(data, Ordering::Relaxed);
+        s.key_xor.store(key ^ data, Ordering::Relaxed);
+    }
+
     /// 使用率（千分率）
     pub fn hashfull(&self) -> usize {
         let n = self.table.len().min(1000);

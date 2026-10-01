@@ -1,18 +1,13 @@
 //! Sailfish - USI プロトコル対応の将棋エンジン
 
-mod eval;
-mod position;
-mod search;
-mod tt;
-mod types;
-
-use position::{perft, Position, START_SFEN};
-use search::{now_us, Limits, Searcher, Shared};
+use sailfish2::position::{perft, Position, START_SFEN};
+use sailfish2::search::{now_us, Limits, Searcher, Shared};
+use sailfish2::types::*;
+use sailfish2::{eval, tt};
 use std::io::{self, BufRead};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use types::*;
 
 const ENGINE_NAME: &str = "Sailfish 2.0-dev";
 const ENGINE_AUTHOR: &str = "dax";
@@ -82,6 +77,11 @@ impl Engine {
             "EvalMobility" => {
                 if let Ok(v) = value.parse() {
                     eval::MOBILITY_WEIGHT.store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            "Feat" => {
+                if let Ok(v) = value.parse() {
+                    sailfish2::search::FEAT.store(v, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             "MultiPV" => {
@@ -192,6 +192,12 @@ impl Engine {
     }
 }
 
+/// Threads の初期値: 論理コア数の半分（物理コア数のめやす）。多すぎると GUI や他のエンジンの邪魔になるので 4 までにする。
+fn default_threads() -> usize {
+    let logical = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    (logical / 2).clamp(1, 4)
+}
+
 fn main() {
     now_us(); // 時計の基準を初期化
     let shared = Arc::new(Shared::new());
@@ -203,7 +209,7 @@ fn main() {
         hash_mb: 256,
         network_delay: 120,
         multipv: 1,
-        threads: 1,
+        threads: default_threads(),
     };
 
     let stdin = io::stdin();
@@ -219,7 +225,7 @@ fn main() {
                 println!("option name USI_Hash type spin default 256 min 1 max 65536");
                 println!("option name NetworkDelay type spin default 120 min 0 max 10000");
                 println!("option name MultiPV type spin default 1 min 1 max 10");
-                println!("option name Threads type spin default 1 min 1 max 64");
+                println!("option name Threads type spin default {} min 1 max 64", default_threads());
                 println!("usiok");
             }
             "setoption" => engine.setoption(&tokens),

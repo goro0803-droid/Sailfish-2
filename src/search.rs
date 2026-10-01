@@ -5,9 +5,24 @@ use crate::eval::{evaluate, PIECE_VALUE};
 use crate::position::{MoveList, Position, MAX_MOVES};
 use crate::tt::*;
 use crate::types::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
+
+/// 探索の改良を個別に入れ替えるためのビット（USI の隠しオプション Feat で指定。強さの比較用）
+pub static FEAT: AtomicU32 = AtomicU32::new(F_QS_TT);
+/// 静止探索でも置換表を使う
+pub const F_QS_TT: u32 = 1;
+/// 置換表に手がないとき、深さを 1 減らす（Internal Iterative Reduction）
+pub const F_IIR: u32 = 2;
+/// 評価値が 2 手前より良くなっているかで、枝刈りと LMR の強さを変える
+pub const F_IMPROVING: u32 = 4;
+/// ヌルムーブの減らし方を、深さと評価値の余裕に応じて大きくする
+pub const F_NULL2: u32 = 8;
+/// 評価値を局面ごとに覚えておく（同じ局面を何度も評価しない）
+pub const F_ECACHE: u32 = 16;
+
+const ECACHE_BITS: usize = 18;
 
 pub const MAX_PLY: usize = 128;
 pub const INF: i32 = 31000;
@@ -75,6 +90,12 @@ pub struct Searcher {
     pub threads: usize,
     /// 0 = 主スレッド（info の出力・時間管理を行う）、1 以上 = 補助スレッド
     helper_idx: usize,
+    /// 有効な探索の改良（F_ のビット）
+    feat: u32,
+    /// 各 ply の静的評価値（王手を受けているときは -INF）
+    static_evals: [i32; MAX_PLY + 2],
+    /// 評価値のキャッシュ（局面のキー, 評価値）。スレッドごとに持つ。
+    ecache: Vec<(u64, i32)>,
     root_excluded: Vec<Move>,
     nodes: u64,
     stopped: bool,
@@ -136,6 +157,9 @@ impl Searcher {
             multipv: 1,
             threads: 1,
             helper_idx: 0,
+            feat: 0,
+            static_evals: [-INF; MAX_PLY + 2],
+            ecache: vec![(0, 0); 1 << ECACHE_BITS],
             root_excluded: Vec::new(),
             nodes: 0,
             stopped: false,
@@ -158,11 +182,28 @@ impl Searcher {
         now_us().saturating_sub(self.shared.start_us.load(Ordering::Relaxed)) / 1000
     }
 
+    /// 静的評価（F_ECACHE が有効なら、同じ局面の評価値を覚えておく）
+    #[inline]
+    fn eval(&mut self, pos: &Position) -> i32 {
+        if self.feat & F_ECACHE == 0 {
+            return evaluate(pos);
+        }
+        let i = pos.key as usize & ((1 << ECACHE_BITS) - 1);
+        let e = self.ecache[i];
+        if e.0 == pos.key {
+            return e.1;
+        }
+        let v = evaluate(pos);
+        self.ecache[i] = (pos.key, v);
+        v
+    }
+
     /// 補助スレッド用の探索状態を作る（置換表と停止フラグは主スレッドと共有）
     fn make_helper(&self, idx: usize) -> Searcher {
         let mut h = Searcher::with_tt(self.tt.clone(), self.shared.clone());
         h.limits = self.limits;
         h.helper_idx = idx;
+        h.feat = self.feat;
         h
     }
 
@@ -204,6 +245,7 @@ impl Searcher {
     pub fn think(&mut self, pos: &mut Position) {
         self.shared.nodes.store(0, Ordering::Relaxed);
         self.shared.helpers_stop.store(false, Ordering::Relaxed);
+        self.feat = FEAT.load(Ordering::Relaxed);
         self.history.iter_mut().for_each(|h| *h /= 4);
 
         let root_moves = pos.legal_moves();
@@ -453,7 +495,7 @@ impl Searcher {
             }
         }
         if ply >= MAX_PLY - 4 {
-            return evaluate(pos);
+            return self.eval(pos);
         }
 
         let key = pos.key;
@@ -472,16 +514,30 @@ impl Searcher {
         }
 
         let in_check = pos.in_check();
-        let static_eval = if in_check { -INF } else { evaluate(pos) };
+        let static_eval = if in_check { -INF } else { self.eval(pos) };
+        self.static_evals[ply] = static_eval;
+        // 2 手前（自分の手番）より評価値が良くなっているか（わからないときは良くなっている扱い）
+        let imp_on = self.feat & F_IMPROVING != 0;
+        let improving = ply < 2 || self.static_evals[ply - 2] == -INF || static_eval > self.static_evals[ply - 2];
+
+        // Internal Iterative Reduction: 置換表に手がない局面は、深く読んでも並べ替えが効かないので浅くする
+        if self.feat & F_IIR != 0 && tt_move == MOVE_NONE && depth >= 4 && !in_check {
+            depth -= 1;
+        }
 
         if !pv_node && !in_check && ply > 0 {
             // Reverse futility pruning
-            if depth <= 3 && static_eval - 150 * depth >= beta && static_eval.abs() < MATE_BOUND {
+            let rfp_depth = if imp_on && improving { depth - 1 } else { depth };
+            if depth <= 3 && static_eval - 150 * rfp_depth >= beta && static_eval.abs() < MATE_BOUND {
                 return static_eval;
             }
             // Null move pruning
             if null_ok && depth >= 3 && static_eval >= beta {
-                let r = 2 + depth / 4;
+                let r = if self.feat & F_NULL2 != 0 {
+                    3 + depth / 3 + ((static_eval - beta) / 200).clamp(0, 2)
+                } else {
+                    2 + depth / 4
+                };
                 pos.do_null();
                 let s = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, false);
                 pos.undo_null();
@@ -532,7 +588,9 @@ impl Searcher {
 
             if !pv_node && !in_check && !gives_check && quiet && best > -MATE_BOUND {
                 // Late move pruning（浅い深さでの後半の静かな手を省略）
-                if depth <= 3 && legal > 4 + depth * depth * 3 {
+                let lmp_base = 4 + depth * depth * 3;
+                let lmp_limit = if imp_on && !improving { lmp_base * 2 / 3 } else { lmp_base };
+                if depth <= 3 && legal > lmp_limit {
                     pos.undo_move();
                     continue;
                 }
@@ -557,6 +615,9 @@ impl Searcher {
                     r = self.lmr[(depth.min(63) as usize) * 64 + legal.min(63) as usize];
                     if pv_node {
                         r -= 1;
+                    }
+                    if imp_on && !improving {
+                        r += 1;
                     }
                     // ヒストリーの良い手は浅くしすぎない
                     if self.history[piece as usize * 81 + to] > 4000 {
@@ -632,17 +693,38 @@ impl Searcher {
         }
         self.sel_depth = self.sel_depth.max(ply);
         if ply >= MAX_PLY - 4 {
-            return evaluate(pos);
+            return self.eval(pos);
+        }
+
+        let orig_alpha = alpha;
+        let pv_node = beta - alpha > 1;
+        let key = pos.key;
+        let use_tt = self.feat & F_QS_TT != 0;
+        let mut tt_move = MOVE_NONE;
+        if use_tt {
+            if let Some(e) = self.tt.probe(key) {
+                tt_move = e.mv;
+                if !pv_node {
+                    let s = score_from_tt(e.score as i32, ply);
+                    if e.flag == BOUND_EXACT
+                        || (e.flag == BOUND_LOWER && s >= beta)
+                        || (e.flag == BOUND_UPPER && s <= alpha)
+                    {
+                        return s;
+                    }
+                }
+            }
         }
 
         let in_check = pos.in_check();
+        let mut best_move = MOVE_NONE;
         let mut list = MoveList::new();
         let mut best;
         if in_check {
             best = -INF;
             pos.gen_moves(&mut list, false);
         } else {
-            let stand = evaluate(pos);
+            let stand = self.eval(pos);
             if stand >= beta {
                 return stand;
             }
@@ -652,7 +734,7 @@ impl Searcher {
         }
 
         let mut scores = [0i32; MAX_MOVES];
-        self.order_moves(pos, &list, &mut scores, MOVE_NONE, ply);
+        self.order_moves(pos, &list, &mut scores, tt_move, ply);
 
         let mut legal = 0;
         for i in 0..list.len {
@@ -679,6 +761,7 @@ impl Searcher {
             }
             if s > best {
                 best = s;
+                best_move = m;
                 if s > alpha {
                     alpha = s;
                     self.update_pv(ply, m);
@@ -691,6 +774,16 @@ impl Searcher {
 
         if in_check && legal == 0 {
             return -MATE + ply as i32;
+        }
+        if use_tt {
+            let flag = if best >= beta {
+                BOUND_LOWER
+            } else if best > orig_alpha {
+                BOUND_EXACT
+            } else {
+                BOUND_UPPER
+            };
+            self.tt.store_qs(key, best_move, score_to_tt(best, ply), flag);
         }
         best
     }

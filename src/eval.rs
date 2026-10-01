@@ -1,9 +1,16 @@
 //! 評価関数（駒割り + 玉の安全度 + 大駒の働き + 玉との距離による攻め・守り）。
 //! 値は手番側から見たセンチポーン単位（歩 ≒ 100）。
 
+use crate::params::PST;
 use crate::position::{Position, NO_SQ};
 use crate::types::*;
 use std::sync::atomic::{AtomicI32, Ordering};
+
+/// 駒の点数表の添字（後手は盤を 180 度回して先手の向きにそろえる）
+#[inline]
+pub fn pst_index(c: usize, sq: usize, pt: u8) -> usize {
+    pt as usize * 81 + if c == BLACK { sq } else { 80 - sq }
+}
 
 /// 調整用の重み（USI の隠しオプション EvalKingDanger / EvalMobility で変更できる）
 pub static KING_DANGER_PCT: AtomicI32 = AtomicI32::new(100);
@@ -124,7 +131,24 @@ fn king_danger(pos: &Position, c: usize, att: &[[u8; 81]; 2]) -> i32 {
     (danger * danger / 260).min(2500)
 }
 
+/// 手番側から見た評価値
 pub fn evaluate(pos: &Position) -> i32 {
+    let score = eval_impl::<true>(pos);
+    let s = score[BLACK] - score[WHITE];
+    if pos.side == BLACK {
+        s
+    } else {
+        -s
+    }
+}
+
+/// 駒の点数表を除いた評価値（先手から見た値）。学習用。
+pub fn eval_without_pst(pos: &Position) -> i32 {
+    let score = eval_impl::<false>(pos);
+    score[BLACK] - score[WHITE]
+}
+
+fn eval_impl<const PST_ON: bool>(pos: &Position) -> [i32; 2] {
     let mut score = [0i32; 2];
     let mut att = [[0u8; 81]; 2];
     let mut mobility = [0i32; 2];
@@ -137,6 +161,10 @@ pub fn evaluate(pos: &Position) -> i32 {
         }
         let c = color_of(p);
         let pt = type_of(p);
+        if PST_ON {
+            let i = pst_index(c, sq, pt);
+            score[c] += PST[i / 81][i % 81] as i32;
+        }
         if pt == KING {
             score[c] += KING_RANK[rel_rank(c, sq % 9)];
             continue;
@@ -169,10 +197,5 @@ pub fn evaluate(pos: &Position) -> i32 {
         score[c] += mobility[c] * mw;
         score[c] -= king_danger(pos, c, &att) * kd / 100;
     }
-    let s = score[BLACK] - score[WHITE];
-    if pos.side == BLACK {
-        s
-    } else {
-        -s
-    }
+    score
 }
