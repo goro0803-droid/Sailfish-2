@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "2.1.0"
+version = "2.3.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
@@ -19,3 +19,6 @@ panic = "abort"
 kr2 = []
 kr4 = []
 kr8 = []
+# 第1層（アキュムレータ）の幅（既定は 64）。実験B用。学習したネットワークとエンジンで同じ幅にそろえる必要がある。
+h128 = []
+h256 = []

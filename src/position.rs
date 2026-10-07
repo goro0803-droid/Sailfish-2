@@ -5,6 +5,11 @@ use crate::types::*;
 pub const START_SFEN: &str = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1";
 pub const NO_SQ: usize = 81;
 pub const MAX_MOVES: usize = 1024;
+/// Material swing when captured: removed board value plus the capturer's hand value.
+pub const CAPTURE_VALUE: [i32; 15] = [
+    0, 190, 655, 845, 1035, 1805, 2090, 1140, 20000,
+    640, 880, 980, 1080, 1895, 2495,
+];
 
 pub struct MoveList {
     pub moves: [Move; MAX_MOVES],
@@ -124,6 +129,17 @@ impl Position {
 
         pos.key = pos.compute_key();
         Ok(pos)
+    }
+
+    /// 盤・持ち駒・手番から局面を作る（SFEN を経由しない。教師データの読み込み用）
+    pub fn from_parts(board: [u8; 81], hand: [[u8; 8]; 2], side: usize) -> Position {
+        let mut king = [NO_SQ; 2];
+        for (sq, &p) in board.iter().enumerate() {
+            if p != 0 && type_of(p) == KING { king[color_of(p)] = sq; }
+        }
+        let mut pos = Position { board, hand, side, king, key: 0, history: Vec::with_capacity(1024) };
+        pos.key = pos.compute_key();
+        pos
     }
 
     fn compute_key(&self) -> u64 {
@@ -265,6 +281,54 @@ impl Position {
         false
     }
 
+    /// Check from the post-move occupancy without changing history, hands or hash.
+    /// This accepts pseudo-legal moves; callers must still check king safety.
+    pub fn gives_check(&mut self, m: Move) -> bool {
+        let king = self.king[self.side ^ 1];
+        if king == NO_SQ { return false; }
+        let to = mv_to(m);
+        let captured = self.board[to];
+        let from = if mv_is_drop(m) { NO_SQ } else { mv_from(m) };
+        let moving = if from == NO_SQ {
+            make_piece(self.side, mv_drop_pt(m))
+        } else {
+            let pc = self.board[from];
+            self.board[from] = 0;
+            if mv_is_promo(m) { pc + PROMOTE } else { pc }
+        };
+        self.board[to] = moving;
+        let result = self.attacked(king, self.side);
+        self.board[to] = captured;
+        if from != NO_SQ {
+            self.board[from] = if mv_is_promo(m) { moving - PROMOTE } else { moving };
+        }
+        result
+    }
+
+    /// Exact one-ply checkmate, including quiet checks and legal drops.
+    /// The input position is restored on every path; pawn-drop mate is rejected.
+    pub fn mate_in_one(&mut self) -> Option<Move> {
+        let mut moves = MoveList::new();
+        self.gen_moves(&mut moves, false);
+        for i in 0..moves.len {
+            let m = moves.moves[i];
+            if !self.gives_check(m) || !self.do_move_legal(m) { continue; }
+            let mut replies = MoveList::new();
+            self.gen_moves(&mut replies, false);
+            let mut escape = false;
+            for j in 0..replies.len {
+                if self.do_move_legal(replies.moves[j]) {
+                    self.undo_move();
+                    escape = true;
+                    break;
+                }
+            }
+            self.undo_move();
+            if !escape { return Some(m); }
+        }
+        None
+    }
+
     /// 直前の指し手（なければ MOVE_NONE）
     #[inline]
     pub fn last_move(&self) -> Move {
@@ -272,8 +336,14 @@ impl Position {
     }
 
     /// 静的交換評価（SEE）: 升 to での駒の取り合いを最後まで続けたときの、指す側の損得
-    pub fn see(&self, m: Move) -> i32 {
-        const V: [i32; 15] = [0, 90, 315, 405, 495, 855, 990, 540, 20000, 540, 540, 540, 540, 945, 1395];
+    pub fn see(&self, m: Move) -> i32 { self.see_impl(m, false) }
+
+    /// Shogi exchange values include the captured piece returning to hand unpromoted.
+    pub fn see_with_hand(&self, m: Move) -> i32 { self.see_impl(m, true) }
+
+    fn see_impl(&self, m: Move, with_hand: bool) -> i32 {
+        const BOARD: [i32; 15] = [0, 90, 315, 405, 495, 855, 990, 540, 20000, 540, 540, 540, 540, 945, 1395];
+        let values = if with_hand { &CAPTURE_VALUE } else { &BOARD };
         let to = mv_to(m);
         let mut board = self.board;
         let mut gain = [0i32; 40];
@@ -284,22 +354,22 @@ impl Position {
         } else {
             let p = board[mv_from(m)];
             moving = if mv_is_promo(m) { p + PROMOTE } else { p };
-            gain[0] = V[type_of(board[to]) as usize] + (V[type_of(moving) as usize] - V[type_of(p) as usize]);
+            gain[0] = values[type_of(board[to]) as usize] + (values[type_of(moving) as usize] - values[type_of(p) as usize]);
             board[mv_from(m)] = 0;
         }
         board[to] = moving;
-        let mut on_square = V[type_of(moving) as usize];
+        let mut on_square = values[type_of(moving) as usize];
         let mut side = self.side ^ 1;
         let mut d = 0;
         while d < 38 {
-            let Some((sq, p)) = least_attacker(&board, to, side) else { break };
+            let Some((sq, p)) = least_attacker(&board, to, side, with_hand) else { break };
             d += 1;
             gain[d] = on_square - gain[d - 1];
             // どちらを選んでも損なら打ち切ってよい
             if (-gain[d - 1]).max(gain[d]) < 0 {
                 break;
             }
-            on_square = V[type_of(p) as usize];
+            on_square = values[type_of(p) as usize];
             board[sq] = 0;
             board[to] = p;
             side ^= 1;
@@ -511,7 +581,11 @@ impl Position {
             let to = parse_sq(b[2], b[3])?;
             make_move(from, to, b.len() >= 5 && b[4] == b'+')
         };
-        if self.legal_moves().contains(&m) {
+        // 指定された手だけを合法性判定する。全候補を指して戻す必要はない。
+        let mut list = MoveList::new();
+        self.gen_moves(&mut list, false);
+        if list.moves[..list.len].contains(&m) && self.do_move_legal(m) {
+            self.undo_move();
             Some(m)
         } else {
             None
@@ -558,12 +632,13 @@ impl Position {
 }
 
 /// 升 sq に利いている手番 by の駒のうち、いちばん安い駒（SEE 用）。駒の後ろの利き（X線）も盤から駒を除けば自然に反映される
-fn least_attacker(board: &[u8; 81], sq: usize, by: usize) -> Option<(usize, u8)> {
+fn least_attacker(board: &[u8; 81], sq: usize, by: usize, with_hand: bool) -> Option<(usize, u8)> {
     const ORDER: [i32; 15] = [0, 1, 2, 3, 4, 7, 8, 5, 20, 5, 5, 5, 5, 9, 10];
+    let order = if with_hand { &CAPTURE_VALUE } else { &ORDER };
     let opp = by ^ 1;
     let mut best: Option<(usize, u8)> = None;
     let mut consider = |s: usize, p: u8, best: &mut Option<(usize, u8)>| {
-        if best.map_or(true, |(_, b)| ORDER[type_of(p) as usize] < ORDER[type_of(b) as usize]) {
+        if best.map_or(true, |(_, b)| order[type_of(p) as usize] < order[type_of(b) as usize]) {
             *best = Some((s, p));
         }
     };
@@ -617,3 +692,115 @@ pub fn perft(pos: &mut Position, depth: u32) -> u64 {
     }
     n
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_usi_validation_matches_all_legal_moves() {
+        let mut pos = Position::startpos();
+        let mut rng = 987654321u64;
+        let (mut captures, mut drops, mut promotions, mut checks) = (0, 0, 0, 0);
+        for _ in 0..1500 {
+            let legal = pos.legal_moves();
+            let mut candidates = MoveList::new();
+            pos.gen_moves(&mut candidates, false);
+            let before = (pos.board, pos.hand, pos.king, pos.side, pos.key, pos.history.len());
+            if pos.in_check() { checks += 1; }
+            for &m in &candidates.moves[..candidates.len] {
+                assert_eq!(pos.parse_usi_move(&move_to_usi(m)), legal.contains(&m).then_some(m));
+                assert_eq!(before, (pos.board, pos.hand, pos.king, pos.side, pos.key, pos.history.len()));
+            }
+            assert!(pos.parse_usi_move("5e5e").is_none());
+            assert_eq!(before, (pos.board, pos.hand, pos.king, pos.side, pos.key, pos.history.len()));
+            if legal.is_empty() {
+                pos = Position::startpos();
+            } else {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                let m = legal[(rng % legal.len() as u64) as usize];
+                if mv_is_drop(m) { drops += 1; }
+                else if pos.board[mv_to(m)] != 0 { captures += 1; }
+                if mv_is_promo(m) { promotions += 1; }
+                pos.do_move(m);
+            }
+        }
+        assert!(captures > 20 && drops > 20 && promotions > 10 && checks > 10);
+    }
+}
+
+#[cfg(test)]
+mod tactical_tests {
+    use super::*;
+    #[test]
+    fn checking_move_matches_play_and_restores_position() {
+        let mut p = Position::startpos();
+        let mut rng = 123456789u64;
+        let mut drops = 0;
+        let mut promotions = 0;
+        for _ in 0..300 {
+            let moves = p.legal_moves();
+            let sfen = (p.board, p.hand, p.side, p.king, p.key);
+            let hash = p.key;
+            let hands = p.hand;
+            for &m in &moves {
+                let check = p.gives_check(m);
+                assert_eq!((p.board, p.hand, p.side, p.king, p.key), sfen);
+                assert_eq!(p.key, hash);
+                assert_eq!(p.hand, hands);
+                p.do_move(m);
+                assert_eq!(check, p.in_check());
+                p.undo_move();
+                if mv_is_drop(m) { drops += 1; }
+                if mv_is_promo(m) { promotions += 1; }
+            }
+            if moves.is_empty() { p = Position::startpos(); continue; }
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            p.do_move(moves[rng as usize % moves.len()]);
+        }
+        assert!(drops > 10 && promotions > 10);
+    }
+    #[test]
+    fn mate_in_one_checks_all_replies_and_rejects_pawn_drop_mate() {
+        let mut p = Position::from_sfen("3pkp3/9/4G4/9/9/9/9/9/4K4 b R 1").unwrap();
+        let original = (p.board, p.hand, p.side, p.king, p.key);
+        let key = p.key;
+        let m = p.mate_in_one().expect("rook mate");
+        assert_eq!((p.board, p.hand, p.side, p.king, p.key), original);
+        assert_eq!(p.key, key);
+        assert!(p.do_move_legal(m));
+        assert!(p.in_check());
+        assert!(p.legal_moves().is_empty());
+        p.undo_move();
+        let mut pawn = Position::from_sfen("3pkp3/9/4G4/9/9/9/9/9/4K4 b P 1").unwrap();
+        assert!(pawn.parse_usi_move("P*5b").is_none());
+        assert!(pawn.mate_in_one().is_none());
+        let mut escape = Position::from_sfen("4k4/9/9/9/9/9/9/9/4K4 b R 1").unwrap();
+        assert!(escape.mate_in_one().is_none());
+    }
+}
+
+#[cfg(test)]
+mod exchange_tests {
+    use super::*;
+    #[test]
+    fn captures_account_for_demoted_hand_value() {
+        for pt in PAWN..=DRAGON {
+            if pt == KING { continue; }
+            assert_eq!(CAPTURE_VALUE[pt as usize],
+                crate::eval::PIECE_VALUE[pt as usize] +
+                crate::eval::HAND_VALUE[unpromote(pt) as usize]);
+        }
+        let mut p = Position::from_sfen("k8/5s3/4g4/4+P4/9/9/9/9/8K b - 1").unwrap();
+        let m = p.parse_usi_move("5d5c").unwrap();
+        assert_eq!(p.see(m), 0);
+        assert_eq!(p.see_with_hand(m), 500);
+        let mut p = Position::from_sfen("k8/5s3/4+p4/4G4/9/9/9/9/8K b - 1").unwrap();
+        let m = p.parse_usi_move("5d5c").unwrap();
+        assert_eq!(p.see(m), 0);
+        assert_eq!(p.see_with_hand(m), -500);
+    }
+}
+

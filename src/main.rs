@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 2.1";
+const ENGINE_NAME: &str = "Sailfish 2.3";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
@@ -22,6 +22,8 @@ struct Engine {
     network_delay: u64,
     multipv: usize,
     threads: usize,
+    game_ply: usize,
+    balanced_time: bool,
 }
 
 impl Engine {
@@ -63,6 +65,7 @@ impl Engine {
                     self.hash_mb = v;
                 }
             }
+            "TimeManagement" => { self.balanced_time = value != "legacy"; }
             "NetworkDelay" => {
                 if let Ok(v) = value.parse() {
                     self.network_delay = v;
@@ -126,9 +129,10 @@ impl Engine {
                 return;
             }
         };
+        let mut game_ply = sfen.split_whitespace().nth(3).and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).saturating_sub(1);
         for &s in tokens.iter().skip(moves_idx + 1) {
             match pos.parse_usi_move(s) {
-                Some(m) => pos.do_move(m),
+                Some(m) => { pos.do_move(m); game_ply = game_ply.saturating_add(1); },
                 None => {
                     println!("info string illegal move: {}", s);
                     break;
@@ -136,6 +140,7 @@ impl Engine {
             }
         }
         self.pos = pos;
+        self.game_ply = game_ply;
     }
 
     fn go(&mut self, tokens: &[&str]) {
@@ -176,12 +181,10 @@ impl Engine {
             limits.soft_ms = movetime.saturating_sub(delay).max(10);
             limits.hard_ms = limits.soft_ms;
         } else if time > 0 || byoyomi > 0 || inc > 0 {
-            // 持ち時間 + 秒読み（または加算）の範囲で使える最大時間
-            let cap = time + byoyomi;
-            let hard = (time / 8 + byoyomi + inc).min(cap);
-            let soft = (time / 40 + byoyomi + inc * 3 / 4).min(hard);
-            limits.hard_ms = hard.saturating_sub(delay).max(10);
-            limits.soft_ms = soft.saturating_sub(delay).max(10);
+            let budget = sailfish2::time_control::allocate(time, inc, byoyomi, delay, self.game_ply, self.balanced_time);
+            limits.soft_ms = budget.soft_ms;
+            limits.hard_ms = budget.hard_ms;
+            limits.adaptive_time = self.balanced_time && inc > 0 && byoyomi == 0;
         }
 
         self.ensure_searcher();
@@ -227,6 +230,8 @@ fn main() {
         network_delay: 120,
         multipv: 1,
         threads: default_threads(),
+        game_ply: 0,
+        balanced_time: true,
     };
 
     let stdin = io::stdin();
@@ -241,6 +246,7 @@ fn main() {
                 println!("id author {}", ENGINE_AUTHOR);
                 println!("option name USI_Hash type spin default 256 min 1 max 65536");
                 println!("option name NetworkDelay type spin default 120 min 0 max 10000");
+                println!("option name TimeManagement type combo default balanced var balanced var legacy");
                 println!("option name MultiPV type spin default 1 min 1 max 10");
                 println!("option name Threads type spin default {} min 1 max 64", default_threads());
                 println!("option name UseNeuralNet type check default true");

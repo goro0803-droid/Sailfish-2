@@ -1,0 +1,26 @@
+[
+  {
+    "source": "initial",
+    "position": "startpos"
+  },
+  {
+    "source": "opening1",
+    "position": "startpos moves 7g7f 3c3d 2g2f 8c8d 2f2e 8d8e 6i7h 4a3b 2e2d 2c2d 2h2d"
+  },
+  {
+    "source": "opening2",
+    "position": "startpos moves 7g7f 8c8d 7i6h 3c3d 6h7g 7a6b 5g5f 5c5d 3i4h 3a4b 4i5h 4a3b"
+  },
+  {
+    "source": "Sailfish selfplay data/g7.txt game 1 ply 60",
+    "position": "sfen ln3g2l/1r4k2/ppp1p2sp/1+b1p2p2/2S1gn1p1/2P2p3/PP1P1sP1P/1SGBG1R2/LN1K3NL b 3p 61"
+  },
+  {
+    "source": "Sailfish selfplay data/g7.txt game 2 ply 60",
+    "position": "sfen lr5nl/2s4k1/5g1pb/p1pB1gp1p/1p1ns2P1/P1PP1PP2/1P2PGN1P/1SGK3R1/LN6L b S3P 61"
+  },
+  {
+    "source": "Sailfish selfplay data/g7.txt game 2 ply 100",
+    "position": "sfen l6nl/2+B1S2k1/1G1+P2sp1/prps2p1p/1p2+b2P1/P1P1K1P2/1P3p2P/1+r7/LN6L b 2GSN2Pgn2p 101"
+  }
+]

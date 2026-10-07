@@ -1,0 +1,227 @@
+[
+ {
+  "id": "A1_1s_200",
+  "name": "実験A1（R5から追加学習）対 標準R5、1手1秒 200局",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expA_mekitto_20261006/A1_1s_200",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expA_mekitto_20261006\\nn_A1.nn",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "90000"
+  ]
+ },
+ {
+  "id": "A2_1s_200",
+  "name": "実験A2（ゼロから学習）対 標準R5、1手1秒 200局",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expA_mekitto_20261006/A2_1s_200",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expA_mekitto_20261006\\nn_A2.nn",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "90000"
+  ]
+ },
+ {
+  "id": "A2_1s_confirm400",
+  "name": "実験A2 確認：対 標準R5、1手1秒 追加400局（開始局面 91000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expA_mekitto_20261006/A2_1s_confirm400",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expA_mekitto_20261006\\nn_A2.nn",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "400",
+   "50",
+   "1000",
+   "4",
+   "91000"
+  ]
+ },
+ {
+  "id": "A2_clock40",
+  "name": "実験A2 確認：対 標準R5、5分＋10秒 40局（開始局面 92000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-clock-chunks.mjs",
+   "baseline/expA_mekitto_20261006/A2_clock40",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=120,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expA_mekitto_20261006\\nn_A2.nn",
+   "baseline/sailfish2_time_candidate.exe|Threads=1,USI_Hash=64,NetworkDelay=120",
+   "40",
+   "4",
+   "300000",
+   "10000",
+   "4",
+   "92000"
+  ]
+ },
+ {
+  "id": "B1_1s_200",
+  "name": "実験B1（中間256）対 標準2.2、1手1秒 200局（開始局面 93000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expB_h256_20261006/B1_1s_200",
+   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB_h256_20261006\\nn_B1.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "93000"
+  ]
+ },
+ {
+  "id": "B1_clock40",
+  "name": "実験B1 確認：対 標準2.2、5分＋10秒 40局（開始局面 95000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-clock-chunks.mjs",
+   "baseline/expB_h256_20261006/B1_clock40",
+   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=120,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB_h256_20261006\\nn_B1.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=120",
+   "40",
+   "4",
+   "300000",
+   "10000",
+   "4",
+   "95000"
+  ]
+ },
+ {
+  "id": "B1_1s_confirm400",
+  "name": "実験B1 確認：対 標準2.2、1手1秒 追加400局（開始局面 94000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expB_h256_20261006/B1_1s_confirm400",
+   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB_h256_20261006\\nn_B1.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "400",
+   "50",
+   "1000",
+   "4",
+   "94000"
+  ]
+ },
+ {
+  "id": "B2_64_1s_200",
+  "name": "実験B2-64（全データ、中間64）対 標準2.2、1手1秒 200局（開始局面 96000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expB2_full_20261007/B2_64_1s_200",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_64.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "96000"
+  ]
+ },
+ {
+  "id": "B2_256_1s_200",
+  "name": "実験B2-256（全データ、中間256）対 標準2.2、1手1秒 200局（開始局面 97000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expB2_full_20261007/B2_256_1s_200",
+   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_256.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "97000"
+  ]
+ },
+ {
+  "id": "B2_64_1s_confirm400",
+  "name": "実験B2-64 確認：対 標準2.2、1手1秒 追加400局（開始局面 98000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expB2_full_20261007/B2_64_1s_confirm400",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_64.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "400",
+   "50",
+   "1000",
+   "4",
+   "98000"
+  ]
+ },
+ {
+  "id": "B2_64_clock40",
+  "name": "実験B2-64 確認：対 標準2.2、5分＋10秒 40局（開始局面 100000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-clock-chunks.mjs",
+   "baseline/expB2_full_20261007/B2_64_clock40",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=120,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_64.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=120",
+   "40",
+   "4",
+   "300000",
+   "10000",
+   "4",
+   "100000"
+  ]
+ },
+ {
+  "id": "B2_256_1s_confirm400",
+  "name": "実験B2-256 確認：対 標準2.2、1手1秒 追加400局（開始局面 99000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expB2_full_20261007/B2_256_1s_confirm400",
+   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_256.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "400",
+   "50",
+   "1000",
+   "4",
+   "99000"
+  ]
+ },
+ {
+  "id": "B2_256_clock40",
+  "name": "実験B2-256 確認：対 標準2.2、5分＋10秒 40局（開始局面 101000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-clock-chunks.mjs",
+   "baseline/expB2_full_20261007/B2_256_clock40",
+   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=120,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_256.nn",
+   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=120",
+   "40",
+   "4",
+   "300000",
+   "10000",
+   "4",
+   "101000"
+  ]
+ }
+]

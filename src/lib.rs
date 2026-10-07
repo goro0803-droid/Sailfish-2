@@ -4,6 +4,11 @@ pub mod eval;
 pub mod nn;
 pub mod params;
 pub mod position;
+pub mod psv;
 pub mod search;
 pub mod tt;
 pub mod types;
+
+pub mod training;
+
+pub mod time_control;

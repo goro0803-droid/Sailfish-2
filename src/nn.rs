@@ -17,7 +17,13 @@ use crate::types::*;
 use std::sync::{Arc, RwLock};
 
 /// 第 1 層（アキュムレータ）の幅
+#[cfg(not(any(feature = "h128", feature = "h256")))]
 pub const H: usize = 64;
+/// 実験用（cargo の機能 h128 / h256 で切り替え）。ネットのファイルの先頭に H が書かれているので、幅の違うネットは読み込み時に拒否される
+#[cfg(all(feature = "h128", not(feature = "h256")))]
+pub const H: usize = 128;
+#[cfg(feature = "h256")]
+pub const H: usize = 256;
 /// 第 2 層の幅
 pub const L2: usize = 32;
 /// 盤上の駒の特徴の数: 持ち主(手番側/相手側) × 駒種 14 × 升 81
@@ -206,8 +212,36 @@ pub struct Network {
     pub base_hc: bool,
 }
 
+// AVX keeps the original eight independent sums and their reduction order.
+// Do not use FMA here: rounding changes could alter search decisions.
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx") {
+        // SAFETY: runtime detection includes OS support; slices are bounded below.
+        return unsafe { dot_avx(a, b) };
+    }
+    dot_scalar(a, b)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+    let len = a.len().min(b.len()) / 8 * 8;
+    let mut sum = _mm256_setzero_ps();
+    for i in (0..len).step_by(8) {
+        let x = _mm256_loadu_ps(a.as_ptr().add(i));
+        let y = _mm256_loadu_ps(b.as_ptr().add(i));
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(x, y));
+    }
+    let mut lanes = [0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum()
+}
+
+#[inline]
+fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
     let mut s = [0f32; 8];
     for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
         for k in 0..8 {
@@ -347,6 +381,11 @@ impl Network {
     /// ネットワークの出力（土台を足す前、-1〜1 くらいの値）
     #[inline]
     pub fn forward_raw(&self, acc: &Acc, stm: usize) -> f32 {
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("avx") {
+            // SAFETY: AVX is available; forward_avx checks slice bounds.
+            return unsafe { self.forward_avx(acc, stm) };
+        }
         let mut x = [0f32; 2 * H];
         for i in 0..H {
             x[i] = acc.v[stm][i].clamp(0.0, 1.0);
@@ -360,6 +399,51 @@ impl Network {
         out
     }
 
+    // Compute four second-layer neurons together, sharing each input load.
+    // Keep the scalar lane sums and output accumulation order (no FMA).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx")]
+    unsafe fn forward_avx(&self, acc: &Acc, stm: usize) -> f32 {
+        use std::arch::x86_64::*;
+        let mut x = [0f32; 2 * H];
+        let zero = _mm256_setzero_ps();
+        let one = _mm256_set1_ps(1.0);
+        for persp in 0..2 {
+            let values = &acc.v[stm ^ persp];
+            for i in (0..H).step_by(8) {
+                let v = _mm256_loadu_ps(values.as_ptr().add(i));
+                // The second operand wins on equality/NaN. This order keeps -0
+                // and matches f32::clamp instead of changing activation bits.
+                let clipped = _mm256_min_ps(one, _mm256_max_ps(zero, v));
+                _mm256_storeu_ps(x.as_mut_ptr().add(persp * H + i), clipped);
+            }
+        }
+        let mut out = self.b3;
+        let mut j = 0;
+        while j + 4 <= L2 {
+            let weights = &self.w2[j * 2 * H..(j + 4) * 2 * H];
+            let mut sums = [_mm256_setzero_ps(); 4];
+            for i in (0..2 * H).step_by(8) {
+                let input = _mm256_loadu_ps(x.as_ptr().add(i));
+                for k in 0..4 {
+                    let weight = _mm256_loadu_ps(weights.as_ptr().add(k * 2 * H + i));
+                    sums[k] = _mm256_add_ps(sums[k], _mm256_mul_ps(input, weight));
+                }
+            }
+            for k in 0..4 {
+                let mut lanes = [0f32; 8];
+                _mm256_storeu_ps(lanes.as_mut_ptr(), sums[k]);
+                let z = self.b2[j + k] + lanes.iter().sum::<f32>();
+                out += self.w3[j + k] * z.clamp(0.0, 1.0);
+            }
+            j += 4;
+        }
+        for k in j..L2 {
+            let z = self.b2[k] + dot_avx(&self.w2[k * 2 * H..(k + 1) * 2 * H], &x);
+            out += self.w3[k] * z.clamp(0.0, 1.0);
+        }
+        out
+    }
     /// 局面 pos（手番側から見た）の評価値（cp）。acc は pos に対応するアキュムレータ。
     pub fn forward(&self, acc: &Acc, pos: &Position) -> i32 {
         let stm = pos.side;
@@ -371,6 +455,16 @@ impl Network {
         } else {
             -acc.mat
         };
+        Self::combine(base, out)
+    }
+
+    /// 評価の土台だけをキャッシュした探索から呼ぶ。NN 出力は毎回計算する。
+    pub fn forward_with_base(&self, acc: &Acc, stm: usize, base: i32) -> i32 {
+        Self::combine(base, self.forward_raw(acc, stm))
+    }
+
+    #[inline]
+    fn combine(base: i32, out: f32) -> i32 {
         ((base as f32 + out * OUT_SCALE) as i32).clamp(-20000, 20000)
     }
 
@@ -454,6 +548,67 @@ pub fn load_default() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simd_forward_is_bit_exact() {
+        let nets = [Network::random(19), Network::from_bytes(DEFAULT_NET).unwrap()];
+        let mut rng = 123456789u64;
+        for net in &nets {
+            let mut pos = Position::startpos();
+            for _ in 0..500 {
+                let mut acc = Acc::default();
+                net.refresh(&pos, &mut acc);
+                for stm in 0..2 {
+                    let mut x = [0f32; 2 * H];
+                    for i in 0..H {
+                        x[i] = acc.v[stm][i].clamp(0.0, 1.0);
+                        x[H + i] = acc.v[stm ^ 1][i].clamp(0.0, 1.0);
+                    }
+                    let mut reference = net.b3;
+                    for j in 0..L2 {
+                        let w = &net.w2[j * 2 * H..(j + 1) * 2 * H];
+                        let expected = dot_scalar(w, &x);
+                        assert_eq!(dot(w, &x).to_bits(), expected.to_bits());
+                        let z = net.b2[j] + expected;
+                        reference += net.w3[j] * z.clamp(0.0, 1.0);
+                    }
+                    assert_eq!(net.forward_raw(&acc, stm).to_bits(), reference.to_bits());
+                }
+                let moves = pos.legal_moves();
+                if moves.is_empty() {
+                    pos = Position::startpos();
+                } else {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    pos.do_move(moves[(rng % moves.len() as u64) as usize]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn simd_activation_boundaries_match_scalar() {
+        let net = Network::random(91);
+        let boundaries = [f32::NEG_INFINITY, -1.0, -0.0, 0.0, 0.5, 1.0, 2.0, f32::INFINITY];
+        let mut acc = Acc::default();
+        for persp in 0..2 {
+            for i in 0..H { acc.v[persp][i] = boundaries[(i + persp) % boundaries.len()]; }
+        }
+        for stm in 0..2 {
+            let mut x = [0f32; 2 * H];
+            for i in 0..H {
+                x[i] = acc.v[stm][i].clamp(0.0, 1.0);
+                x[H + i] = acc.v[stm ^ 1][i].clamp(0.0, 1.0);
+            }
+            let mut expected = net.b3;
+            for j in 0..L2 {
+                let z = net.b2[j] + dot_scalar(&net.w2[j * 2 * H..(j + 1) * 2 * H], &x);
+                expected += net.w3[j] * z.clamp(0.0, 1.0);
+            }
+            assert_eq!(net.forward_raw(&acc, stm).to_bits(), expected.to_bits());
+        }
+    }
 
     /// 手を指すたびの差分更新が、局面から作り直した結果と一致するか（ランダムな対局で確かめる）
     #[test]

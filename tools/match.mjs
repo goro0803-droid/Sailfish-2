@@ -2,6 +2,7 @@
 // 使い方: node tools/match.mjs <エンジンA> <エンジンB> [対局数=100] [1手のミリ秒=100] [並列数=6]
 // 同じ序盤で先後を入れ替えて 2 局ずつ指し、A から見た勝敗とレート差（Elo）を出す。
 import { spawn } from 'node:child_process';
+import { writeFileSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { resolve, dirname } from 'node:path';
 
@@ -9,13 +10,32 @@ import { resolve, dirname } from 'node:path';
 const RULES = resolve(import.meta.dirname, '../../ShogiArena/src/js/shogi.js');
 const { Position, START_SFEN, moveToUsi, PAWN } = await import(pathToFileURL(RULES).href);
 
-const [pathA, pathB, gamesArg = '100', msArg = '100', parArg = '6'] = process.argv.slice(2);
+const [pathA, pathB, gamesArg = '100', msArg = '100', parArg = '6', ...extraArgs] = process.argv.slice(2);
+let jsonPath, openingsJson, seedOffset = 0;
+for (let i = 0; i < extraArgs.length; i += 2) {
+  const key = extraArgs[i], value = extraArgs[i + 1];
+  if (value === undefined) throw new Error('Missing optional argument value');
+  if (key === '--openings-json') openingsJson = value;
+  else if (key === '--json') jsonPath = value;
+  else if (key === '--seed-offset' && /^\d+$/.test(value) && Number.isSafeInteger(Number(value))) seedOffset = Number(value);
+  else throw new Error('Optional arguments: --json result.json --seed-offset nonnegative_integer --openings-json openings.json');
+}
 if (!pathA || !pathB) {
   console.log('使い方: node tools/match.mjs <エンジンA> <エンジンB> [対局数] [1手のミリ秒] [並列数]');
   process.exit(1);
 }
 const GAMES = +gamesArg, MS = +msArg, PAR = +parArg;
 const MAX_PLY = 320;
+const explicitOpenings = openingsJson ? JSON.parse(readFileSync(openingsJson, 'utf8')) : null;
+if (explicitOpenings) {
+  if (!Array.isArray(explicitOpenings) || explicitOpenings.length < Math.ceil(GAMES / 2)) throw new Error('Not enough opening pairs');
+  for (const moves of explicitOpenings) {
+    if (!Array.isArray(moves)) throw new Error('Opening must be USI move array');
+    let pos = Position.fromSfen(START_SFEN);
+    for (const u of moves) { const m=pos.findMove(u); if(!m) throw new Error('Illegal opening move: '+u); pos=pos.play(m); }
+  }
+}
+
 
 // エンジンの指定は「パス|オプション=値,オプション=値」の形でもよい（例: suisho.exe|Threads=1,NodesLimit=3000）
 class Engine {
@@ -104,6 +124,7 @@ async function playGame(black, white, opening) {
 }
 
 const results = { w: 0, l: 0, d: 0 };
+const samples = [];
 const reasons = {};
 let next = 0;
 const t0 = Date.now();
@@ -114,14 +135,15 @@ async function worker() {
   while (true) {
     const g = next++;
     if (g >= GAMES) break;
-    const opening = randomOpening(Math.floor(g / 2) + 1);
+    const opening = explicitOpenings ? explicitOpenings[Math.floor(g / 2)] : randomOpening(Math.floor(g / 2) + 1 + seedOffset);
     const aBlack = g % 2 === 0;
     const [r, why] = await playGame(aBlack ? a : b, aBlack ? b : a, opening);
     const aScore = aBlack ? r : 1 - r;
+    samples[g] = { game: g, aBlack, score: aScore, reason: why };
     if (aScore === 1) results.w++; else if (aScore === 0) results.l++; else results.d++;
     reasons[why.split(' ')[0]] = (reasons[why.split(' ')[0]] || 0) + 1;
     const n = results.w + results.l + results.d;
-    process.stdout.write(`\r${n}/${GAMES}  A: ${results.w}勝 ${results.l}敗 ${results.d}分  `);
+    process.stdout.write(`${process.stdout.isTTY ? "\r" : ""}${n}/${GAMES}  A: ${results.w}勝 ${results.l}敗 ${results.d}分  ${process.stdout.isTTY ? "" : "\n"}`);
   }
   a.quit();
   b.quit();
@@ -138,3 +160,20 @@ const hi = -400 * Math.log10(1 / Math.min(0.999, Math.max(0.001, p + 1.96 * se))
 console.log(`\n\n対局数 ${n}（1手 ${MS}ms）  A: ${results.w}勝 ${results.l}敗 ${results.d}分  勝率 ${(p * 100).toFixed(1)}%`);
 console.log(`レート差（A - B）: ${elo.toFixed(0)}  （95%の目安 ${lo.toFixed(0)} 〜 ${hi.toFixed(0)}）`);
 console.log(`終局理由: ${JSON.stringify(reasons)}  所要 ${Math.round((Date.now() - t0) / 1000)}秒`);
+
+// Pair scores account for correlated games from the same opening.
+// Keep the original terminal summary; --json saves all game outcomes as well.
+if (jsonPath) {
+  const pairs = [];
+  for (let i = 0; i + 1 < samples.length; i += 2) pairs.push((samples[i].score + samples[i+1].score) / 2);
+  const mean = pairs.reduce((a,b)=>a+b,0) / pairs.length;
+  const variance = pairs.length > 1 ? pairs.reduce((a,b)=>a+(b-mean)**2,0)/(pairs.length-1) : null;
+  const pairedSe = variance === null ? null : Math.sqrt(variance/pairs.length);
+  const paired95 = pairedSe === null ? null : [Math.max(0,mean-1.96*pairedSe),Math.min(1,mean+1.96*pairedSe)];
+  writeFileSync(jsonPath, JSON.stringify({
+    engineA:pathA,engineB:pathB,openingSource:openingsJson||null,games:n,moveMs:MS,parallel:PAR,seedOffset,results,score:p,elo,
+    score95:[Math.max(0,p-1.96*se),Math.min(1,p+1.96*se)],
+    pairedGames:pairs.length*2,paired95,reasons,
+    elapsedSeconds:(Date.now()-t0)/1000,samples
+  },null,2)+"\n");
+}
