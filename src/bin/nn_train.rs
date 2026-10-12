@@ -25,8 +25,8 @@ use std::thread;
 use std::time::Instant;
 
 struct Data {
-    fa: Vec<u16>,    // 手番側の視点の特徴
-    fb: Vec<u16>,    // 相手側の視点の特徴
+    fa: Vec<u32>,    // 手番側の視点の特徴
+    fb: Vec<u32>,    // 相手側の視点の特徴
     off: Vec<u32>,   // 特徴の開始位置（長さ n+1。fa と fb で共通）
     mat: Vec<f32>,   // 手番側から見た駒割り
     hc: Vec<f32>,    // 手作りの評価関数（手番側から見た値）
@@ -42,7 +42,7 @@ impl Data {
         self.mat.len()
     }
     /// 1局面を加える（load_positions と同じ値の作り方）。score・res は手番側から見た値
-    fn push(&mut self, pos: &Position, base_hc: bool, score: f32, res: f32, tmp: &mut Vec<u16>) {
+    fn push(&mut self, pos: &Position, base_hc: bool, score: f32, res: f32, tmp: &mut Vec<u32>) {
         let stm = pos.side;
         tmp.clear();
         features(pos, stm, tmp);
@@ -71,9 +71,9 @@ impl Data {
 }
 
 /// 左右反転した特徴番号の表
-fn mirror_table() -> &'static [u16] {
-    static T: OnceLock<Vec<u16>> = OnceLock::new();
-    T.get_or_init(|| (0..N_FEATS).map(|f| mirror_feature(f) as u16).collect())
+fn mirror_table() -> &'static [u32] {
+    static T: OnceLock<Vec<u32>> = OnceLock::new();
+    T.get_or_init(|| (0..N_FEATS).map(|f| mirror_feature(f) as u32).collect())
 }
 
 /// 棋譜を読み、静かな局面を集める。戻り値は (データ, 検証用に分ける最初のサンプル番号)
@@ -81,7 +81,7 @@ fn load(paths: &[String], base_hc: bool, filter: TrainingFilter, dedup: bool) ->
     let mut d = Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![] };
     let mut game_starts: Vec<usize> = vec![];
     let mut seen = HashSet::new();
-    let mut tmp: Vec<u16> = Vec::with_capacity(64);
+    let mut tmp: Vec<u32> = Vec::with_capacity(64);
     for path in paths {
         let text = fs::read_to_string(path).unwrap_or_else(|_| panic!("{} を読めません", path));
         for line in text.lines() {
@@ -181,10 +181,26 @@ struct Grad {
     b3: f32,
 }
 
+/// 学習中の第1層の行数：本来の特徴 N_FEATS ＋ 因数分解の特徴 N_FACTOR（halfkp のときだけ。保存のときに足し込む）
+const W1_ROWS: usize = N_FEATS + N_FACTOR;
+/// 第1層の勾配を、スレッドごとに全体で持たず、局面ごとの勾配から行を分担して足し込む（halfkp。第1層が大きいため）
+const SPARSE_W1: bool = N_FACTOR > 0;
+
 impl Grad {
+    /// 勾配の入れ物。full = false なら第1層の重みの分を持たない（SPARSE_W1 のときのスレッドごとの入れ物）
+    fn with_w1(full: bool) -> Grad {
+        Grad {
+            w1: if full { vec![0.0; W1_ROWS * H] } else { vec![] },
+            b1: vec![0.0; H],
+            w2: vec![0.0; L2 * 2 * H],
+            b2: vec![0.0; L2],
+            w3: vec![0.0; L2],
+            b3: 0.0,
+        }
+    }
     fn new() -> Grad {
         Grad {
-            w1: vec![0.0; N_FEATS * H],
+            w1: vec![0.0; W1_ROWS * H],
             b1: vec![0.0; H],
             w2: vec![0.0; L2 * 2 * H],
             b2: vec![0.0; L2],
@@ -224,7 +240,7 @@ struct Fwd {
 }
 
 #[inline]
-fn feat(f: u16, flip: bool) -> usize {
+fn feat(f: u32, flip: bool) -> usize {
     if flip { mirror_table()[f as usize] as usize } else { f as usize }
 }
 
@@ -233,18 +249,21 @@ fn forward(net: &Network, d: &Data, i: usize, flip: bool) -> Fwd {
     let mut a = [[0f32; H]; 2];
     a[0].copy_from_slice(&net.b1);
     a[1].copy_from_slice(&net.b1);
-    for &f in &d.fa[o0..o1] {
-        let f = feat(f, flip);
-        let row = &net.w1[f * H..f * H + H];
-        for k in 0..H {
-            a[0][k] += row[k];
-        }
-    }
-    for &f in &d.fb[o0..o1] {
-        let f = feat(f, flip);
-        let row = &net.w1[f * H..f * H + H];
-        for k in 0..H {
-            a[1][k] += row[k];
+    for (side, feats) in [&d.fa[o0..o1], &d.fb[o0..o1]].into_iter().enumerate() {
+        for &f in feats {
+            let f = feat(f, flip);
+            let row = &net.w1[f * H..f * H + H];
+            for k in 0..H {
+                a[side][k] += row[k];
+            }
+            // 因数分解の特徴（halfkp のときだけ。玉の位置によらない駒の重み）
+            if let Some(p) = factor_of(f) {
+                let r = N_FEATS + p;
+                let row = &net.w1[r * H..r * H + H];
+                for k in 0..H {
+                    a[side][k] += row[k];
+                }
+            }
         }
     }
     let mut x = [0f32; 2 * H];
@@ -274,8 +293,34 @@ fn teacher_target(score: f32, result: f32, teacher_k: f32, lam: f32) -> f32 {
     lam * sigmoid(score / teacher_k) + (1.0 - lam) * result
 }
 
-/// 1 サンプルの損失と勾配（g に加算）
+/// 1 サンプルの損失と勾配（g に加算）。第1層の重みの勾配も g.w1 に足す
 fn sample_grad(net: &Network, d: &Data, i: usize, k: f32, teacher_k: f32, lam: f32, flip: bool, g: &mut Grad) -> f64 {
+    let mut ga = [[0f32; H]; 2];
+    let loss = sample_grad_core(net, d, i, k, teacher_k, lam, flip, g, &mut ga);
+    add_w1_rows(&mut g.w1, d, i, flip, &ga, |_| true);
+    loss
+}
+
+/// 局面 i の特徴の行（因数分解の行を含む）に、視点ごとのアキュムレータの勾配 ga を足す。owns(行) が false の行は飛ばす
+#[inline]
+fn add_w1_rows(w1: &mut [f32], d: &Data, i: usize, flip: bool, ga: &[[f32; H]; 2], owns: impl Fn(usize) -> bool) {
+    let (o0, o1) = (d.off[i] as usize, d.off[i + 1] as usize);
+    for (side, feats) in [&d.fa[o0..o1], &d.fb[o0..o1]].into_iter().enumerate() {
+        for &ft in feats {
+            let ft = feat(ft, flip);
+            for r in [Some(ft), factor_of(ft).map(|p| N_FEATS + p)].into_iter().flatten() {
+                if !owns(r) { continue; }
+                let row = &mut w1[r * H..r * H + H];
+                for q in 0..H {
+                    row[q] += ga[side][q];
+                }
+            }
+        }
+    }
+}
+
+/// 1 サンプルの損失と、第1層の重み以外の勾配（g に加算）。第1層のアキュムレータの勾配を ga に返す
+fn sample_grad_core(net: &Network, d: &Data, i: usize, k: f32, teacher_k: f32, lam: f32, flip: bool, g: &mut Grad, ga: &mut [[f32; H]; 2]) -> f64 {
     let f = forward(net, d, i, flip);
     let eval = d.mat[i] + f.out * OUT_SCALE;
     let p = sigmoid(eval / k);
@@ -298,27 +343,11 @@ fn sample_grad(net: &Network, d: &Data, i: usize, k: f32, teacher_k: f32, lam: f
             }
         }
     }
-    let mut ga = [[0f32; H]; 2];
     for p_ in 0..2 {
         for q in 0..H {
             let act = f.a[p_][q];
             ga[p_][q] = if act > 0.0 && act < 1.0 { gx[p_ * H + q] } else { 0.0 };
             g.b1[q] += ga[p_][q];
-        }
-    }
-    let (o0, o1) = (d.off[i] as usize, d.off[i + 1] as usize);
-    for &ft in &d.fa[o0..o1] {
-        let ft = feat(ft, flip);
-        let row = &mut g.w1[ft * H..ft * H + H];
-        for q in 0..H {
-            row[q] += ga[0][q];
-        }
-    }
-    for &ft in &d.fb[o0..o1] {
-        let ft = feat(ft, flip);
-        let row = &mut g.w1[ft * H..ft * H + H];
-        for q in 0..H {
-            row[q] += ga[1][q];
         }
     }
     loss
@@ -330,21 +359,81 @@ struct Adam {
     t: i32,
 }
 
+/// Adam の1要素の更新
+#[inline]
+fn adam_upd(w: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32], lr: f32, scale: f32, c1: f32, c2: f32) {
+    let (b1, b2) = (0.9f32, 0.999f32);
+    for i in 0..w.len() {
+        let gi = g[i] * scale;
+        m[i] = b1 * m[i] + (1.0 - b1) * gi;
+        v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;
+        w[i] -= lr * (m[i] / c1) / ((v[i] / c2).sqrt() + 1e-8);
+    }
+}
+
+/// 複数のスレッドで、重なりのない行を書き換えるための生ポインタ（行の分担は「行番号 % スレッド数」で決め、重ならない）
+#[derive(Clone, Copy)]
+struct RowPtr(*mut f32);
+unsafe impl Send for RowPtr {}
+unsafe impl Sync for RowPtr {}
+impl RowPtr {
+    /// SAFETY: 呼び出し側は、同じ行を同時に2つのスレッドから使わないこと
+    unsafe fn row(self, r: usize) -> &'static mut [f32] {
+        std::slice::from_raw_parts_mut(self.0.add(r * H), H)
+    }
+}
+
+/// 第1層の勾配を「行を分担して」足し込み、勾配のあった行だけ Adam で更新する（SPARSE_W1 のとき）。
+/// ga[n] はバッチの n 番目の局面（slice[n]、左右反転 flips[n]）のアキュムレータの勾配。足し込んだ行の勾配は 0 に戻す。
+fn sparse_w1_step(net: &mut Network, opt: &mut Adam, gw1: &mut [f32], d: &Data, slice: &[u32], flips: &[bool], ga: &[[[f32; H]; 2]],
+                  lr: f32, scale: f32, threads: usize) {
+    let c1 = 1.0 - 0.9f32.powi(opt.t);
+    let c2 = 1.0 - 0.999f32.powi(opt.t);
+    let (w, g, m, v) = (RowPtr(net.w1.as_mut_ptr()), RowPtr(gw1.as_mut_ptr()), RowPtr(opt.m.w1.as_mut_ptr()), RowPtr(opt.v.w1.as_mut_ptr()));
+    thread::scope(|s| {
+        for t in 0..threads {
+            s.spawn(move || {
+                let mut touched: Vec<usize> = vec![];
+                let mut seen = vec![false; W1_ROWS];
+                for (n, &si) in slice.iter().enumerate() {
+                    let i = si as usize;
+                    let (o0, o1) = (d.off[i] as usize, d.off[i + 1] as usize);
+                    for (side, feats) in [&d.fa[o0..o1], &d.fb[o0..o1]].into_iter().enumerate() {
+                        for &ft in feats {
+                            let ft = feat(ft, flips[n]);
+                            for r in [Some(ft), factor_of(ft).map(|p| N_FEATS + p)].into_iter().flatten() {
+                                if r % threads != t { continue; }
+                                // SAFETY: 行 r はこのスレッドだけが扱う
+                                let row = unsafe { g.row(r) };
+                                for q in 0..H { row[q] += ga[n][side][q]; }
+                                if !seen[r] { seen[r] = true; touched.push(r); }
+                            }
+                        }
+                    }
+                }
+                for r in touched {
+                    // SAFETY: 行 r はこのスレッドだけが扱う
+                    unsafe {
+                        adam_upd(w.row(r), g.row(r), m.row(r), v.row(r), lr, scale, c1, c2);
+                        g.row(r).iter_mut().for_each(|x| *x = 0.0);
+                    }
+                }
+            });
+        }
+    });
+}
+
 impl Adam {
+    /// 1回の更新。SPARSE_W1 のときは第1層の重みを更新しない（sparse_w1_step で行う。t はここで進める）
     fn step(&mut self, net: &mut Network, g: &Grad, lr: f32, scale: f32) {
         self.t += 1;
         let (b1, b2) = (0.9f32, 0.999f32);
         let c1 = 1.0 - b1.powi(self.t);
         let c2 = 1.0 - b2.powi(self.t);
-        let upd = |w: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32]| {
-            for i in 0..w.len() {
-                let gi = g[i] * scale;
-                m[i] = b1 * m[i] + (1.0 - b1) * gi;
-                v[i] = b2 * v[i] + (1.0 - b2) * gi * gi;
-                w[i] -= lr * (m[i] / c1) / ((v[i] / c2).sqrt() + 1e-8);
-            }
-        };
-        upd(&mut net.w1, &g.w1, &mut self.m.w1, &mut self.v.w1);
+        let upd = |w: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32]| adam_upd(w, g, m, v, lr, scale, c1, c2);
+        if !SPARSE_W1 {
+            upd(&mut net.w1, &g.w1, &mut self.m.w1, &mut self.v.w1);
+        }
         upd(&mut net.b1, &g.b1, &mut self.m.b1, &mut self.v.b1);
         upd(&mut net.w2, &g.w2, &mut self.m.w2, &mut self.v.w2);
         upd(&mut net.b2, &g.b2, &mut self.m.b2, &mut self.v.b2);
@@ -501,7 +590,50 @@ struct Progress {
     loss_cnt: u64,
 }
 
-const CKPT_MAGIC: &[u8; 8] = b"SFCKPT01";
+/// 02：ネットを、因数分解の行も含めてそのままの並びで保存する（01 は Network::to_bytes の形）
+const CKPT_MAGIC: &[u8; 8] = b"SFCKPT02";
+
+/// 学習中のネット（因数分解の行つき）を、エンジンで読める形にする（因数分解の重みを各特徴の行へ足し込む）
+fn export(net: &Network) -> Network {
+    let mut o = net.clone();
+    o.q = None;
+    if N_FACTOR == 0 {
+        return o;
+    }
+    o.w1.truncate(N_FEATS * H);
+    for f in 0..N_FEATS {
+        let r = N_FEATS + factor_of(f).unwrap();
+        for k in 0..H {
+            o.w1[f * H + k] += net.w1[r * H + k];
+        }
+    }
+    o
+}
+
+/// エンジンの形のネットに、因数分解の行（最初は 0）を足して学習用にする
+fn for_training(mut net: Network) -> Network {
+    if net.w1.len() == N_FEATS * H {
+        net.w1.resize(W1_ROWS * H, 0.0);
+    }
+    net
+}
+
+/// 学習中のネットを、そのままの並び（因数分解の行を含む）でバイト列にする
+fn net_raw_bytes(net: &Network, out: &mut Vec<u8>) {
+    out.extend_from_slice(&(net.base_hc as u32).to_le_bytes());
+    for v in [&net.w1, &net.b1, &net.w2, &net.b2, &net.w3] { put_f32s(out, v); }
+    out.extend_from_slice(&net.b3.to_le_bytes());
+}
+
+fn net_from_raw(b: &[u8], at: &mut usize) -> Network {
+    let base_hc = u32::from_le_bytes(b[*at..*at + 4].try_into().unwrap()) != 0;
+    *at += 4;
+    let mut g = Grad::new();
+    grad_from_bytes(&mut g, b, at);
+    let mut net = Network::random(1);
+    (net.w1, net.b1, net.w2, net.b2, net.w3, net.b3, net.base_hc) = (g.w1, g.b1, g.w2, g.b2, g.w3, g.b3, base_hc);
+    net
+}
 
 fn save_ckpt(path: &str, cfg: &PsvConfig, p: &Progress, net: &Network, opt: &Adam) {
     let mut b = Vec::new();
@@ -512,9 +644,7 @@ fn save_ckpt(path: &str, cfg: &PsvConfig, p: &Progress, net: &Network, opt: &Ada
     for v in [p.epoch as u64, p.chunks_done as u64, p.step as u64, p.loss_cnt, opt.t as u64] { b.extend_from_slice(&v.to_le_bytes()); }
     b.extend_from_slice(&p.best_val.to_le_bytes());
     b.extend_from_slice(&p.loss_sum.to_le_bytes());
-    let nb = net.to_bytes();
-    b.extend_from_slice(&(nb.len() as u64).to_le_bytes());
-    b.extend_from_slice(&nb);
+    net_raw_bytes(net, &mut b);
     grad_to_bytes(&opt.m, &mut b);
     grad_to_bytes(&opt.v, &mut b);
     let tmp = format!("{}.tmp", path);
@@ -537,9 +667,7 @@ fn load_ckpt(path: &str, cfg: &PsvConfig) -> (Progress, Network, Adam) {
     let (epoch, chunks_done, step, loss_cnt, t) = (u64_at(&mut at), u64_at(&mut at), u64_at(&mut at), u64_at(&mut at), u64_at(&mut at));
     let best_val = f64::from_bits(u64_at(&mut at));
     let loss_sum = f64::from_bits(u64_at(&mut at));
-    let nl = u64_at(&mut at) as usize;
-    let net = Network::from_bytes(&b[at..at + nl]).expect("チェックポイントのネットを読めません");
-    at += nl;
+    let net = net_from_raw(&b, &mut at);
     let mut opt = Adam { m: Grad::new(), v: Grad::new(), t: t as i32 };
     grad_from_bytes(&mut opt.m, &b, &mut at);
     grad_from_bytes(&mut opt.v, &b, &mut at);
@@ -584,16 +712,23 @@ fn train_psv(out_path: &str, cfg: &PsvConfig, init_net: Network, resume: bool) {
             eprintln!("{} があります。続きから学習するなら --resume を付けてください", ckpt_path);
             std::process::exit(1);
         }
-        let net = init_net;
+        let net = for_training(init_net);
         let v = validate(&net, &vd, cfg.k, cfg.teacher_k, cfg.lam, 0, vd.len(), threads);
         println!("開始時の検証  損失 ネットワーク {:.5} / 手作り {:.5}   cp 誤差 ネットワーク {:.1} / 手作り {:.1}", v[0], v[1], v[2], v[3]);
         // ウォームスタートのネットも最良候補に含め、初期値より悪い学習で上書きしない。
-        write_atomic(out_path, &net.to_bytes());
+        write_atomic(out_path, &export(&net).to_bytes());
         (Progress { epoch: 1, chunks_done: 0, step: 0, best_val: v[0], loss_sum: 0.0, loss_cnt: 0 }, net, Adam { m: Grad::new(), v: Grad::new(), t: 0 })
     };
 
-    let mut grads: Vec<Grad> = (0..threads).map(|_| Grad::new()).collect();
-    let mut total = Grad::new();
+    let mut grads: Vec<Grad> = (0..threads).map(|_| Grad::with_w1(!SPARSE_W1)).collect();
+    let mut total = Grad::with_w1(!SPARSE_W1);
+    // SPARSE_W1 のとき：第1層の勾配（全体で1つ）、バッチの局面ごとのアキュムレータの勾配、左右反転の有無
+    let mut gw1: Vec<f32> = if SPARSE_W1 { vec![0.0; W1_ROWS * H] } else { vec![] };
+    let mut ga_store: Vec<[[f32; H]; 2]> = if SPARSE_W1 { vec![[[0.0; H]; 2]; cfg.batch] } else { vec![] };
+    let mut flips: Vec<bool> = vec![false; cfg.batch];
+    if SPARSE_W1 {
+        println!("第1層 {} 行（因数分解 {} 行を含む）の勾配は、行を分担して足し込む", W1_ROWS, N_FACTOR);
+    }
     const SEED: u64 = 88172645463325252;
     while p.epoch <= cfg.epochs {
         let mut order: Vec<usize> = (0..n_chunks).collect();
@@ -614,16 +749,32 @@ fn train_psv(out_path: &str, cfg: &PsvConfig, init_net: Network, resume: bool) {
                 let (netr, dr) = (&net, &d);
                 let mirror = cfg.mirror;
                 let (k, teacher_k, lam) = (cfg.k, cfg.teacher_k, cfg.lam);
+                for (n, &si) in slice.iter().enumerate() {
+                    flips[n] = mirror && ((si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ flip_seed) >> 63 == 1;
+                }
+                let flipsr = &flips;
                 let losses: Vec<f64> = thread::scope(|s| {
                     let mut hs = vec![];
+                    let mut ga_parts = ga_store.chunks_mut(chunk.max(1));
                     for (t, g) in grads.iter_mut().enumerate() {
-                        let part = &slice[(t * chunk).min(slice.len())..((t + 1) * chunk).min(slice.len())];
+                        let (lo, hi) = ((t * chunk).min(slice.len()), ((t + 1) * chunk).min(slice.len()));
+                        let part = &slice[lo..hi];
+                        let ga_part = if SPARSE_W1 { ga_parts.next() } else { None };
                         hs.push(s.spawn(move || {
                             g.clear();
                             let mut l = 0.0f64;
-                            for &si in part {
-                                let flip = mirror && ((si as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ flip_seed) >> 63 == 1;
-                                l += sample_grad(netr, dr, si as usize, k, teacher_k, lam, flip, g);
+                            match ga_part {
+                                // 第1層の勾配はあとで行を分担して足すので、ここではアキュムレータの勾配だけを控える
+                                Some(gp) => {
+                                    for (j, &si) in part.iter().enumerate() {
+                                        l += sample_grad_core(netr, dr, si as usize, k, teacher_k, lam, flipsr[lo + j], g, &mut gp[j]);
+                                    }
+                                }
+                                None => {
+                                    for (j, &si) in part.iter().enumerate() {
+                                        l += sample_grad(netr, dr, si as usize, k, teacher_k, lam, flipsr[lo + j], g);
+                                    }
+                                }
                             }
                             l
                         }));
@@ -634,7 +785,11 @@ fn train_psv(out_path: &str, cfg: &PsvConfig, init_net: Network, resume: bool) {
                 for g in &grads {
                     total.add(g);
                 }
-                opt.step(&mut net, &total, lr, 1.0 / slice.len() as f32);
+                let scale = 1.0 / slice.len() as f32;
+                opt.step(&mut net, &total, lr, scale);
+                if SPARSE_W1 {
+                    sparse_w1_step(&mut net, &mut opt, &mut gw1, &d, slice, &flips[..slice.len()], &ga_store[..slice.len()], lr, scale, threads);
+                }
                 p.loss_sum += losses.iter().sum::<f64>();
                 p.loss_cnt += slice.len() as u64;
                 p.step += 1;
@@ -655,7 +810,7 @@ fn train_psv(out_path: &str, cfg: &PsvConfig, init_net: Network, resume: bool) {
                 // 検証の損失が最も小さかった時点のネットワークを保存する（過学習の前のもの）
                 if better {
                     p.best_val = v[0];
-                    write_atomic(out_path, &net.to_bytes());
+                    write_atomic(out_path, &export(&net).to_bytes());
                 }
             }
             if epoch_end {
@@ -750,6 +905,10 @@ fn main() {
         train_psv(&out_path, &cfg, net, resume);
         return;
     }
+    if SPARSE_W1 {
+        eprintln!("halfkp のビルドでは --psv の学習だけに対応しています");
+        std::process::exit(1);
+    }
     println!("学習フィルタ: 静かな駒打ち={} ランダム序盤を除外={} 同一局面除外={}", filter.quiet_drops, filter.skip_opening, dedup);
     let (d, val_start) = if positions {
         load_positions(&pos_args[3..], net.base_hc, filter)
@@ -838,6 +997,90 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ランダムな対局の局面から作った小さなデータ
+    fn random_data(n_games: usize, seed: u64) -> Data {
+        let mut d = Data::new();
+        let mut tmp = Vec::new();
+        let mut rng = seed;
+        for _ in 0..n_games {
+            let mut pos = Position::startpos();
+            for _ in 0..80 {
+                let moves = pos.legal_moves();
+                if moves.is_empty() { break; }
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                pos.do_move(moves[(rng % moves.len() as u64) as usize]);
+                d.push(&pos, true, (rng % 1000) as f32 - 500.0, (rng % 2) as f32, &mut tmp);
+            }
+        }
+        d
+    }
+
+    /// 第1層の勾配を「行を分担して足し込む」方法（sparse_w1_step）と、従来の方法（スレッドごとに全体）で、
+    /// 更新後の重みがほぼ一致する（足す順番が違うので、丸めの差だけ許す）
+    #[test]
+    fn sparse_w1_matches_dense() {
+        let d = random_data(4, 31);
+        let net0 = for_training(Network::random(77));
+        let slice: Vec<u32> = (0..d.len() as u32).collect();
+        let flips: Vec<bool> = slice.iter().map(|&s| s % 3 == 0).collect();
+        let (k, tk, lam, lr) = (600.0, 600.0, 0.7, 0.01);
+        let scale = 1.0 / slice.len() as f32;
+        // 従来の方法
+        let mut dense = net0.clone();
+        let mut g = Grad::new();
+        for (n, &si) in slice.iter().enumerate() {
+            sample_grad(&dense, &d, si as usize, k, tk, lam, flips[n], &mut g);
+        }
+        let mut opt_d = Adam { m: Grad::new(), v: Grad::new(), t: 0 };
+        opt_d.t += 1;
+        let (c1, c2) = (1.0 - 0.9f32.powi(1), 1.0 - 0.999f32.powi(1));
+        adam_upd(&mut dense.w1, &g.w1, &mut opt_d.m.w1, &mut opt_d.v.w1, lr, scale, c1, c2);
+        // 行を分担する方法（3スレッド）
+        let mut sparse = net0.clone();
+        let mut g2 = Grad::with_w1(false);
+        let mut ga = vec![[[0f32; H]; 2]; slice.len()];
+        for (n, &si) in slice.iter().enumerate() {
+            sample_grad_core(&sparse, &d, si as usize, k, tk, lam, flips[n], &mut g2, &mut ga[n]);
+        }
+        let mut opt_s = Adam { m: Grad::new(), v: Grad::new(), t: 1 };
+        let mut gw1 = vec![0f32; W1_ROWS * H];
+        sparse_w1_step(&mut sparse, &mut opt_s, &mut gw1, &d, &slice, &flips, &ga, lr, scale, 3);
+        assert!(gw1.iter().all(|&x| x == 0.0), "足し込んだ勾配が 0 に戻っていない");
+        let mut changed = 0;
+        for i in 0..dense.w1.len() {
+            assert!((dense.w1[i] - sparse.w1[i]).abs() < 1e-6, "第1層の重みが合わない（{}）", i);
+            if dense.w1[i] != net0.w1[i] { changed += 1; }
+        }
+        assert!(changed > 1000, "更新された重みが少なすぎる: {}", changed);
+    }
+
+    /// 因数分解の重みを足し込んだネット（export）の出力が、学習中のネットの出力とほぼ一致する
+    #[test]
+    fn export_matches_training_net() {
+        let d = random_data(2, 5);
+        let mut net = for_training(Network::random(9));
+        // 因数分解の行にも値を入れる（halfkp のとき）
+        for (i, w) in net.w1[N_FEATS * H..].iter_mut().enumerate() { *w = ((i % 97) as f32 - 48.0) * 1e-3; }
+        let e = export(&net);
+        assert_eq!(e.w1.len(), N_FEATS * H);
+        let mut acc = Acc::default();
+        for i in 0..d.len().min(60) {
+            let f = forward(&net, &d, i, false);
+            // データの特徴から、足し込んだネットでアキュムレータを作り、エンジン側の出力（forward_raw）と比べる
+            for (side, persp_feats) in [(0, &d.fa), (1, &d.fb)] {
+                let (o0, o1) = (d.off[i] as usize, d.off[i + 1] as usize);
+                acc.v[side].copy_from_slice(&e.b1);
+                for &ft in &persp_feats[o0..o1] {
+                    for q in 0..H { acc.v[side][q] += e.w1[ft as usize * H + q]; }
+                }
+                for q in 0..H { assert!((acc.v[side][q] - f.a[side][q]).abs() < 1e-4); }
+            }
+            assert!((e.forward_raw(&acc, 0) - f.out).abs() < 1e-4);
+        }
+    }
     #[test]
     fn teacher_scale_keeps_side_sign_and_legacy_target() {
         let k = 600.0; let lam = 0.9;

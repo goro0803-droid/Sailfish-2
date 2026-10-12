@@ -99,6 +99,10 @@ pub struct Shared {
     pub stop: AtomicBool,
     pub ponder: AtomicBool,
     pub start_us: AtomicU64,
+    /// 打ち切りの上限（hard_ms）を数え始めた時刻。ふだんは start_us と同じで、PonderTime=total では ponderhit の時刻
+    pub hard_from_us: AtomicU64,
+    /// この探索の soft_ms（ponderhit のときに USI の側で見る）
+    pub soft_ms: AtomicU64,
     /// 主スレッドが読み終えたので、補助スレッドも止める
     pub helpers_stop: AtomicBool,
     /// 全スレッドの合計ノード数（1024 ノードごとに加算）
@@ -111,6 +115,8 @@ impl Shared {
             stop: AtomicBool::new(false),
             ponder: AtomicBool::new(false),
             start_us: AtomicU64::new(0),
+            hard_from_us: AtomicU64::new(0),
+            soft_ms: AtomicU64::new(0),
             helpers_stop: AtomicBool::new(false),
             nodes: AtomicU64::new(0),
         }
@@ -322,6 +328,11 @@ impl Searcher {
         now_us().saturating_sub(self.shared.start_us.load(Ordering::Relaxed)) / 1000
     }
 
+    /// 打ち切りの上限（hard_ms）と比べる経過時間
+    fn hard_elapsed_ms(&self) -> u64 {
+        now_us().saturating_sub(self.shared.hard_from_us.load(Ordering::Relaxed)) / 1000
+    }
+
     /// NN の土台の手作り評価だけを再利用する。差分更新の浮動小数点値はキャッシュしない。
     #[inline]
     fn eval(&mut self, pos: &Position, ply: usize) -> i32 {
@@ -412,7 +423,7 @@ impl Searcher {
             let (m, cap) = self.pend[ply];
             let (a, b) = self.accs.split_at_mut(ply);
             if m == MOVE_NONE {
-                b[0].clone_from(&a[ply - 1]);
+                b[0].copy_from(&a[ply - 1], nn.q.is_some());
             } else {
                 nn.apply_after(&a[ply - 1], pos, m, cap, &mut b[0]);
             }
@@ -439,7 +450,7 @@ impl Searcher {
             self.stopped = true;
             return;
         }
-        if !self.shared.ponder.load(Ordering::Relaxed) && self.elapsed_ms() >= self.limits.hard_ms {
+        if !self.shared.ponder.load(Ordering::Relaxed) && self.hard_elapsed_ms() >= self.limits.hard_ms {
             self.stopped = true;
         }
     }
@@ -662,7 +673,7 @@ impl Searcher {
         for &m in root_moves {
             if self.shared.stop.load(Ordering::Relaxed)
                 || (!self.shared.ponder.load(Ordering::Relaxed)
-                    && self.elapsed_ms() >= self.limits.hard_ms) { break; }
+                    && self.hard_elapsed_ms() >= self.limits.hard_ms) { break; }
             if mv_is_promo(m) || (!mv_is_drop(m) && pos.board[mv_to(m)] != 0)
                 || pos.see(m) < 0 || !pos.gives_check(m) { continue; }
             if !pos.do_move_legal(m) { continue; }

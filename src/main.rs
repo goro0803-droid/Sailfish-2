@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 2.3";
+const ENGINE_NAME: &str = "Sailfish 2.4";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
@@ -24,6 +24,8 @@ struct Engine {
     threads: usize,
     game_ply: usize,
     balanced_time: bool,
+    /// PonderTime=total: 先読み（go ponder）の時間も思考時間に数える。false（reset）は ponderhit で時計を 0 に戻す
+    ponder_total: bool,
 }
 
 impl Engine {
@@ -66,6 +68,8 @@ impl Engine {
                 }
             }
             "TimeManagement" => { self.balanced_time = value != "legacy"; }
+            // 先読みが当たったときの時間の使い方（隠しオプション。実験P で total を既定にした。reset は 2.4 までの動作）
+            "PonderTime" => { self.ponder_total = value == "total"; }
             "NetworkDelay" => {
                 if let Ok(v) = value.parse() {
                     self.network_delay = v;
@@ -92,6 +96,10 @@ impl Engine {
                 if let Err(e) = sailfish2::nn::load_global(&value) {
                     println!("info string EvalFile を読み込めません: {}", e);
                 }
+            }
+            // 評価関数を整数（int16）で計算する（隠しオプション。2.4 から既定 true）
+            "NNQuant" => {
+                sailfish2::nn::set_quant_global(value.eq_ignore_ascii_case("true"));
             }
             "MultiPV" => {
                 if let Ok(v) = value.parse::<usize>() {
@@ -190,7 +198,10 @@ impl Engine {
         self.ensure_searcher();
         self.shared.stop.store(false, Ordering::SeqCst);
         self.shared.ponder.store(ponder, Ordering::SeqCst);
-        self.shared.start_us.store(now_us(), Ordering::SeqCst);
+        self.shared.soft_ms.store(limits.soft_ms, Ordering::SeqCst);
+        let now = now_us();
+        self.shared.start_us.store(now, Ordering::SeqCst);
+        self.shared.hard_from_us.store(now, Ordering::SeqCst);
 
         let mut searcher = self.searcher.take().unwrap();
         searcher.limits = limits;
@@ -217,6 +228,8 @@ fn default_threads() -> usize {
 
 fn main() {
     now_us(); // 時計の基準を初期化
+    // 2.4 から、評価関数は整数（int16）で計算するのが標準（実験C1）。USI の NNQuant=false で f32 に戻せる
+    sailfish2::nn::set_quant_global(true);
     if let Err(e) = sailfish2::nn::load_default() {
         eprintln!("埋め込みのネットワークを読み込めません: {}", e);
     }
@@ -232,6 +245,7 @@ fn main() {
         threads: default_threads(),
         game_ply: 0,
         balanced_time: true,
+        ponder_total: true,
     };
 
     let stdin = io::stdin();
@@ -273,7 +287,18 @@ fn main() {
             }
             "stop" => engine.stop(),
             "ponderhit" => {
-                engine.shared.start_us.store(now_us(), Ordering::SeqCst);
+                // 打ち切りの上限は、自分の時計が動き出したこの時点から数える
+                let now = now_us();
+                engine.shared.hard_from_us.store(now, Ordering::SeqCst);
+                if engine.ponder_total {
+                    // 先読みの時間も数える。もう soft を過ぎていれば、読み終えた反復の最善手ですぐ指す
+                    let elapsed_ms = now.saturating_sub(engine.shared.start_us.load(Ordering::SeqCst)) / 1000;
+                    if elapsed_ms >= engine.shared.soft_ms.load(Ordering::SeqCst) {
+                        engine.shared.stop.store(true, Ordering::SeqCst);
+                    }
+                } else {
+                    engine.shared.start_us.store(now, Ordering::SeqCst);
+                }
                 engine.shared.ponder.store(false, Ordering::SeqCst);
             }
             "gameover" => engine.stop(),

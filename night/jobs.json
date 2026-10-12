@@ -190,38 +190,106 @@
   ]
  },
  {
-  "id": "B2_256_1s_confirm400",
-  "name": "実験B2-256 確認：対 標準2.2、1手1秒 追加400局（開始局面 99000〜）",
+  "id": "C1_256_1s_200",
+  "name": "実験C1-256（整数化、中間256・B2-256）対 標準2.3、1手1秒 200局（開始局面 102000〜）",
   "cmd": [
    "C:\\Program Files\\nodejs\\node.exe",
    "--no-warnings",
    "tools/run-match-chunks.mjs",
-   "baseline/expB2_full_20261007/B2_256_1s_confirm400",
-   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_256.nn",
-   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "baseline/expC1_quant_20261008/C1_256_1s_200",
+   "baseline/expC1_quant_20261008/sailfish2_c1_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,NNQuant=true,EvalFile=C:/Users/goro0/OneDrive/Documents/shogi/Sailfish2/baseline/expB2_full_20261007/nn_B2_256.nn",
+   "baseline/standard_B2_64_20261008/sailfish2_2.3.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "102000"
+  ]
+ },
+ {
+  "id": "C1_64_1s_200",
+  "name": "実験C1-64（整数化、中間64・B2-64）対 標準2.3、1手1秒 200局（開始局面 103000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expC1_quant_20261008/C1_64_1s_200",
+   "baseline/expC1_quant_20261008/sailfish2_c1_h64.exe|Threads=1,USI_Hash=64,NetworkDelay=0,NNQuant=true",
+   "baseline/standard_B2_64_20261008/sailfish2_2.3.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "103000"
+  ]
+ },
+ {
+  "id": "C1_256_1s_confirm400",
+  "name": "実験C1-256 確認：対 標準2.3、1手1秒 追加400局（開始局面 104000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expC1_quant_20261008/C1_256_1s_confirm400",
+   "baseline/expC1_quant_20261008/sailfish2_c1_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=0,NNQuant=true,EvalFile=C:/Users/goro0/OneDrive/Documents/shogi/Sailfish2/baseline/expB2_full_20261007/nn_B2_256.nn",
+   "baseline/standard_B2_64_20261008/sailfish2_2.3.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
    "400",
    "50",
    "1000",
    "4",
-   "99000"
+   "104000"
   ]
  },
  {
-  "id": "B2_256_clock40",
-  "name": "実験B2-256 確認：対 標準2.2、5分＋10秒 40局（開始局面 101000〜）",
+  "id": "C1_256_clock40",
+  "name": "実験C1-256 確認：対 標準2.3、5分＋10秒 40局（開始局面 106000〜）",
   "cmd": [
    "C:\\Program Files\\nodejs\\node.exe",
    "--no-warnings",
    "tools/run-clock-chunks.mjs",
-   "baseline/expB2_full_20261007/B2_256_clock40",
-   "baseline/expB_h256_20261006/sailfish2_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=120,EvalFile=C:\\Users\\goro0\\OneDrive\\Documents\\shogi\\Sailfish2\\baseline\\expB2_full_20261007\\nn_B2_256.nn",
-   "baseline/standard_A2_20261006/sailfish2_2.2.exe|Threads=1,USI_Hash=64,NetworkDelay=120",
+   "baseline/expC1_quant_20261008/C1_256_clock40",
+   "baseline/expC1_quant_20261008/sailfish2_c1_h256.exe|Threads=1,USI_Hash=64,NetworkDelay=120,NNQuant=true,EvalFile=C:/Users/goro0/OneDrive/Documents/shogi/Sailfish2/baseline/expB2_full_20261007/nn_B2_256.nn",
+   "baseline/standard_B2_64_20261008/sailfish2_2.3.exe|Threads=1,USI_Hash=64,NetworkDelay=120",
    "40",
    "4",
    "300000",
    "10000",
    "4",
-   "101000"
+   "106000"
+  ]
+ },
+ {
+  "id": "C1_64_1s_confirm400",
+  "name": "実験C1-64 確認：対 標準2.3、1手1秒 追加400局（開始局面 105000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expC1_quant_20261008/C1_64_1s_confirm400",
+   "baseline/expC1_quant_20261008/sailfish2_c1_h64.exe|Threads=1,USI_Hash=64,NetworkDelay=0,NNQuant=true",
+   "baseline/standard_B2_64_20261008/sailfish2_2.3.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "400",
+   "50",
+   "1000",
+   "4",
+   "105000"
+  ]
+ },
+ {
+  "id": "C2_1s_200",
+  "name": "実験C2（HalfKP、中間256、整数化）対 標準2.4、1手1秒 200局（開始局面 108000〜）",
+  "cmd": [
+   "C:\\Program Files\\nodejs\\node.exe",
+   "--no-warnings",
+   "tools/run-match-chunks.mjs",
+   "baseline/expC2_halfkp_20261011/C2_1s_200",
+   "baseline/expC2_halfkp_20261011/sailfish2_halfkp.exe|Threads=1,USI_Hash=64,NetworkDelay=0,EvalFile=C:/Users/goro0/OneDrive/Documents/shogi/Sailfish2/baseline/expC2_halfkp_20261011/nn_C2.nn",
+   "baseline/standard_C1_256_20261011/sailfish2_2.4.exe|Threads=1,USI_Hash=64,NetworkDelay=0",
+   "200",
+   "50",
+   "1000",
+   "4",
+   "108000"
   ]
  }
 ]
