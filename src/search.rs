@@ -88,7 +88,38 @@ pub const INF: i32 = 31000;
 pub const MATE: i32 = 30000;
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 
+/// 連続王手の千日手・入玉宣言で勝つときの値。評価値（±20000 まで）より大きく、詰みの値（MATE_BOUND 以上）より小さい。近いほど大きい
+#[inline]
+fn repetition_win(ply: usize) -> i32 {
+    MATE_BOUND - 1 - ply as i32
+}
+
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// 省略の診断の書き出し先（環境変数 SAILFISH_DIAG のファイル。cargo の機能 prune_diag のときだけ使う）
+static DIAG_OUT: OnceLock<std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
+
+/// 1 行を書く: 種類（1=局面全体の省略、2=静かな手の省略）,深さ,省略の判定に使う深さ,改善しているか,評価と窓の差,読んだ結果と窓の差
+fn diag_write(kind: u8, depth: i32, eff_depth: i32, improving: bool, gap: i32, result: i32) {
+    use std::io::Write;
+    let m = DIAG_OUT.get_or_init(|| {
+        std::sync::Mutex::new(std::env::var("SAILFISH_DIAG").ok().and_then(|p| {
+            std::fs::OpenOptions::new().create(true).append(true).open(p).ok().map(std::io::BufWriter::new)
+        }))
+    });
+    if let Some(w) = m.lock().unwrap().as_mut() {
+        let _ = writeln!(w, "{},{},{},{},{},{}", kind, depth, eff_depth, improving as u8, gap, result);
+    }
+}
+
+fn diag_flush() {
+    use std::io::Write;
+    if let Some(m) = DIAG_OUT.get() {
+        if let Some(w) = m.lock().unwrap().as_mut() {
+            let _ = w.flush();
+        }
+    }
+}
 
 pub fn now_us() -> u64 {
     EPOCH.get_or_init(Instant::now).elapsed().as_micros() as u64
@@ -175,6 +206,11 @@ pub struct Searcher {
     root_goal_moves: Vec<Move>,
     iteration_depth: i32,
     singular_verifying: bool,
+    /// 省略の診断（cargo の機能 prune_diag）：確かめるための探索の最中か、省略しない ply、間引きの数
+    diag_verifying: bool,
+    diag_noprune_ply: usize,
+    diag_ctr: u64,
+    diag_every: u64,
     singular_probes: u64,
     singular_extensions: u64,
     nodes: u64,
@@ -305,6 +341,10 @@ impl Searcher {
             root_goal_moves: Vec::new(),
             iteration_depth: 0,
             singular_verifying: false,
+            diag_verifying: false,
+            diag_noprune_ply: usize::MAX,
+            diag_ctr: 0,
+            diag_every: std::env::var("SAILFISH_DIAG_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1),
             singular_probes: 0,
             singular_extensions: 0,
             nodes: 0,
@@ -501,6 +541,9 @@ impl Searcher {
         });
 
         self.wait_for_stop();
+        if cfg!(feature = "prune_diag") {
+            diag_flush();
+        }
         if ponder != MOVE_NONE {
             println!("bestmove {} ponder {}", move_to_usi(best), move_to_usi(ponder));
         } else {
@@ -608,7 +651,14 @@ impl Searcher {
             previous_iteration_ms = iteration_ms;
             let pondering = self.shared.ponder.load(Ordering::Relaxed);
             if !self.limits.infinite && !pondering {
-                if ms >= self.limits.soft_ms || predicted_stop || root_moves.len() == 1 {
+                // 実験T1（cargo の機能 time_unstable）：最善手・評価が落ち着いていなければ、soft の 1.25 倍（hard まで）まで次の反復を始める。
+                // stop_before_next の目標と同じ。既定では soft で必ず打ち切るので、この延長は働かない。
+                let soft_limit = if cfg!(feature = "time_unstable") && self.limits.adaptive_time && stable_iterations < 2 {
+                    (self.limits.soft_ms.saturating_mul(5) / 4).min(self.limits.hard_ms)
+                } else {
+                    self.limits.soft_ms
+                };
+                if ms >= soft_limit || predicted_stop || root_moves.len() == 1 {
                     break;
                 }
                 // 詰みを読み切った
@@ -773,8 +823,17 @@ impl Searcher {
         self.sel_depth = self.sel_depth.max(ply);
 
         if ply > 0 {
-            if pos.is_repetition() {
+            if cfg!(feature = "perpetual_check") {
+                // 連続王手の千日手は、王手をかけ続けた側の負け（それ以外の繰り返しは引き分け）
+                if let Some(r) = pos.repetition_result() {
+                    return r * repetition_win(ply);
+                }
+            } else if pos.is_repetition() {
                 return 0;
+            }
+            // 入玉宣言（cargo の機能 nyugyoku）：手番側が宣言できる局面は勝ち
+            if cfg!(feature = "nyugyoku") && pos.can_declare() {
+                return repetition_win(ply);
             }
             // 詰み距離による枝刈り
             alpha = alpha.max(-MATE + ply as i32);
@@ -821,7 +880,26 @@ impl Searcher {
         if excluded == MOVE_NONE && !pv_node && !in_check && ply > 0 {
             // Reverse futility pruning
             let rfp_depth = if imp_on && improving { depth - 1 } else { depth };
-            if self.feat & D_NO_RFP == 0 && depth <= 3 && static_eval - 150 * rfp_depth >= beta && static_eval.abs() < MATE_BOUND {
+            // 省略の診断：静的評価が β 以上の浅い局面を、この局面では省略せずに同じ深さで読み、結果を記録する（SAILFISH_DIAG_EVERY 回に 1 回、既定 8）
+            if cfg!(feature = "prune_diag") && !self.diag_verifying && depth <= 3
+                && static_eval >= beta && static_eval.abs() < MATE_BOUND && beta.abs() < MATE_BOUND
+            {
+                self.diag_ctr += 1;
+                if self.diag_ctr % self.diag_every == 0 {
+                    self.diag_verifying = true;
+                    self.diag_noprune_ply = ply;
+                    let v = self.negamax(pos, beta - 1, beta, depth, ply, null_ok);
+                    self.diag_verifying = false;
+                    self.diag_noprune_ply = usize::MAX;
+                    self.pv_len[ply] = 0;
+                    self.static_evals[ply] = static_eval;
+                    if self.stopped {
+                        return 0;
+                    }
+                    diag_write(1, depth, rfp_depth, improving, static_eval - beta, v - beta);
+                }
+            }
+            if self.feat & D_NO_RFP == 0 && ply != self.diag_noprune_ply && depth <= 3 && static_eval - 150 * rfp_depth >= beta && static_eval.abs() < MATE_BOUND {
                 return static_eval;
             }
             // Null move pruning
@@ -933,6 +1011,22 @@ impl Searcher {
 
             if !(protected_reply && self.feat & F_TACTICAL_PRUNE != 0)
                 && excluded == MOVE_NONE && !pv_node && !in_check && !gives_check && quiet && best > -MATE_BOUND {
+                // 省略の診断：静的評価が α 以下の浅い局面の静かな手を、省略せずに読み、結果を記録する（SAILFISH_DIAG_EVERY 回に 1 回、既定 8）
+                if cfg!(feature = "prune_diag") && !self.diag_verifying && depth <= 3 && legal > 1
+                    && static_eval <= alpha && alpha.abs() < MATE_BOUND
+                {
+                    self.diag_ctr += 1;
+                    if self.diag_ctr % self.diag_every == 0 {
+                        self.diag_verifying = true;
+                        let s = -self.negamax(pos, -alpha - 1, -alpha, depth - 1, ply + 1, true);
+                        self.diag_verifying = false;
+                        if self.stopped {
+                            pos.undo_move();
+                            return 0;
+                        }
+                        diag_write(2, depth, depth, improving, alpha - static_eval, s - alpha);
+                    }
+                }
                 // Late move pruning（浅い深さでの後半の静かな手を省略）
                 let lmp_base = 4 + depth * depth * 3;
                 let lmp_limit = if imp_on && !improving { lmp_base * 2 / 3 } else { lmp_base };
@@ -1043,12 +1137,19 @@ impl Searcher {
             return 0;
         }
         self.sel_depth = self.sel_depth.max(ply);
+        if cfg!(feature = "nyugyoku") && ply > 0 && pos.can_declare() {
+            return repetition_win(ply);
+        }
         if ply >= MAX_PLY - 4 {
             self.ensure_acc(pos, ply);
             return self.eval(pos, ply);
         }
 
-        if self.feat & (F_QCHECK_CAPTURE | F_QCHECK_QUIET | F_QMATE1) != 0 && pos.is_repetition() { return 0; }
+        if self.feat & (F_QCHECK_CAPTURE | F_QCHECK_QUIET | F_QMATE1) != 0 {
+            if cfg!(feature = "perpetual_check") {
+                if let Some(r) = pos.repetition_result() { return r * repetition_win(ply); }
+            } else if pos.is_repetition() { return 0; }
+        }
         let orig_alpha = alpha;
         let pv_node = beta - alpha > 1;
         let key = pos.key;

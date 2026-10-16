@@ -568,6 +568,75 @@ impl Position {
         false
     }
 
+    /// 手番側が入玉宣言（CSA ルール、27点法）の条件を満たすか（持ち時間の条件は GUI・サーバーが扱う）。
+    /// 玉が敵陣にいる、敵陣に玉以外の自分の駒が 10 枚以上、敵陣の駒と持ち駒の点数（飛・角と成り駒は 5点、ほかは 1点）が
+    /// 先手 28点以上・後手 27点以上、王手をかけられていない。玉の位置を先に調べるので、ふだんはすぐ false を返す。
+    pub fn can_declare(&self) -> bool {
+        let us = self.side;
+        let k = self.king[us];
+        if k == NO_SQ || rel_rank(us, k % 9) > 2 {
+            return false;
+        }
+        let mut count = 0;
+        let mut points = 0;
+        for sq in 0..81 {
+            let p = self.board[sq];
+            if p == 0 || color_of(p) != us || rel_rank(us, sq % 9) > 2 {
+                continue;
+            }
+            let pt = type_of(p);
+            if pt == KING {
+                continue;
+            }
+            count += 1;
+            points += if matches!(unpromote(pt), BISHOP | ROOK) { 5 } else { 1 };
+        }
+        if count < 10 {
+            return false;
+        }
+        for pt in PAWN..=GOLD {
+            let n = self.hand[us][pt as usize] as i32;
+            points += if pt == BISHOP || pt == ROOK { 5 * n } else { n };
+        }
+        points >= if us == BLACK { 28 } else { 27 } && !self.in_check()
+    }
+
+    /// 同じ局面の繰り返しの結果（cargo の機能 perpetual_check で使う）。
+    /// None = 繰り返しでない、Some(0) = 千日手（引き分け）、
+    /// Some(1) = 手番側の勝ち（相手が王手をかけ続けた）、Some(-1) = 手番側の負け（手番側が王手をかけ続けた）。
+    /// 繰り返しを見つけたときだけ、写した局面で手を戻しながら、その間の王手の有無を調べる。
+    pub fn repetition_result(&self) -> Option<i32> {
+        let n = self.history.len();
+        let mut j = n;
+        let mut count = 0;
+        let mut len = None;
+        while j > 0 && count < 256 {
+            j -= 1;
+            count += 1;
+            let st = &self.history[j];
+            if st.mv == MOVE_NONE {
+                break;
+            }
+            if (n - j) % 2 == 0 && st.key == self.key {
+                len = Some(n - j);
+                break;
+            }
+        }
+        let len = len?;
+        let mut p = self.clone();
+        let (mut us_checked, mut them_checked) = (true, true);
+        for k in 0..len {
+            // k が偶数: 手番側が指す局面（王手されていれば、直前の相手の手が王手）。奇数: 相手が指す局面
+            if k % 2 == 0 {
+                us_checked &= p.in_check();
+            } else {
+                them_checked &= p.in_check();
+            }
+            p.undo_move();
+        }
+        Some(if us_checked { 1 } else if them_checked { -1 } else { 0 })
+    }
+
     pub fn parse_usi_move(&mut self, s: &str) -> Option<Move> {
         let b = s.as_bytes();
         if b.len() < 4 {
@@ -728,6 +797,37 @@ mod tests {
             }
         }
         assert!(captures > 20 && drops > 20 && promotions > 10 && checks > 10);
+    }
+}
+
+#[cfg(test)]
+mod declare_tests {
+    use super::*;
+
+    #[test]
+    fn black_needs_28_points_and_10_pieces() {
+        // 敵陣に玉以外 10 枚（竜・馬 各5点、金銀成桂成香 7 枚と歩 1 枚）＝ 18点 ＋ 持ち駒の歩
+        let ok = Position::from_sfen("+R+BGGSS+N+N+L/4K3P/9/9/9/9/9/9/4k4 b 10P 1").unwrap();
+        assert!(ok.can_declare()); // 28点
+        let short = Position::from_sfen("+R+BGGSS+N+N+L/4K3P/9/9/9/9/9/9/4k4 b 9P 1").unwrap();
+        assert!(!short.can_declare()); // 27点（先手は 28点が要る）
+        let nine = Position::from_sfen("+R+BGGSS+N+N+L/4K4/9/9/9/9/9/9/4k4 b 11P 1").unwrap();
+        assert!(!nine.can_declare()); // 点数は足りるが、敵陣の駒が 9 枚
+        let checked = Position::from_sfen("+R+BGGSS+N+N+L/4K3P/4g4/9/9/9/9/9/4k4 b 10P 1").unwrap();
+        assert!(!checked.can_declare()); // 王手をかけられている
+        let third = Position::from_sfen("+R+BGGSS+N+N+L/8P/4K4/9/9/9/9/9/4k4 b 10P 1").unwrap();
+        assert!(third.can_declare()); // 3段目も敵陣
+        let not_in_camp = Position::from_sfen("+R+BGGSS+N+N+L/8P/9/4K4/9/9/9/9/4k4 b 10P 1").unwrap();
+        assert!(!not_in_camp.can_declare()); // 玉が敵陣の外
+    }
+
+    #[test]
+    fn white_needs_27_points() {
+        // 敵陣に 10 枚で 18点 ＋ 持ち駒の歩
+        let ok = Position::from_sfen("4K4/9/9/9/9/9/9/p3k4/+l+n+nssgg+b+r w 9p 1").unwrap();
+        assert!(ok.can_declare()); // 27点
+        let short = Position::from_sfen("4K4/9/9/9/9/9/9/p3k4/+l+n+nssgg+b+r w 8p 1").unwrap();
+        assert!(!short.can_declare());
     }
 }
 

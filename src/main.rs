@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 2.4";
+const ENGINE_NAME: &str = "Sailfish 2.5";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
@@ -26,6 +26,13 @@ struct Engine {
     balanced_time: bool,
     /// PonderTime=total: 先読み（go ponder）の時間も思考時間に数える。false（reset）は ponderhit で時計を 0 に戻す
     ponder_total: bool,
+    /// GUI が Ponder を使う（USI_Ponder=true）
+    usi_ponder: bool,
+    /// 定跡を使う（cargo の機能 book のときだけ意味がある）
+    use_book: bool,
+    /// go ponder の局面が定跡にあったとき、ponderhit か stop で返す bestmove の行
+    book_pending: Option<String>,
+    rng: u64,
 }
 
 impl Engine {
@@ -36,7 +43,31 @@ impl Engine {
         }
     }
 
+    /// 定跡で先読み中だった手を返す
+    fn flush_book_pending(&mut self) {
+        if let Some(line) = self.book_pending.take() {
+            println!("{}", line);
+        }
+    }
+
+    /// 定跡にあれば、探索せずに手を決める（bestmove の行と info の行）
+    fn book_move(&mut self) -> Option<(String, String)> {
+        if !cfg!(feature = "book") || !self.use_book {
+            return None;
+        }
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        let b = sailfish2::book::global().pick(&self.pos, self.rng)?;
+        let (best, info) = match &b.ponder {
+            Some(p) => (format!("bestmove {} ponder {}", b.mv, p), format!("info depth 0 score cp {} pv {} {}", b.value, b.mv, p)),
+            None => (format!("bestmove {}", b.mv), format!("info depth 0 score cp {} pv {}", b.value, b.mv)),
+        };
+        Some((best, info))
+    }
+
     fn stop(&mut self) {
+        self.flush_book_pending();
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.ponder.store(false, Ordering::SeqCst);
         self.join();
@@ -70,6 +101,8 @@ impl Engine {
             "TimeManagement" => { self.balanced_time = value != "legacy"; }
             // 先読みが当たったときの時間の使い方（隠しオプション。実験P で total を既定にした。reset は 2.4 までの動作）
             "PonderTime" => { self.ponder_total = value == "total"; }
+            "USI_Ponder" => { self.usi_ponder = value.eq_ignore_ascii_case("true"); }
+            "UseBook" => { self.use_book = value.eq_ignore_ascii_case("true"); }
             "NetworkDelay" => {
                 if let Ok(v) = value.parse() {
                     self.network_delay = v;
@@ -183,6 +216,31 @@ impl Engine {
             }
         }
 
+        self.book_pending = None;
+        // 入玉宣言（cargo の機能 nyugyoku）：条件を満たしていれば宣言する（検討の go infinite では宣言しない）
+        if cfg!(feature = "nyugyoku") && !limits.infinite && self.pos.can_declare() {
+            println!("info string declare");
+            if ponder {
+                self.book_pending = Some("bestmove win".to_string());
+            } else {
+                println!("bestmove win");
+            }
+            return;
+        }
+        // 定跡（対局のときだけ。検討の go infinite や、深さ・ノード数を決めた探索では使わない）
+        if !limits.infinite && limits.depth == 0 && limits.nodes == 0 {
+            if let Some((best, info)) = self.book_move() {
+                println!("info string book");
+                println!("{}", info);
+                if ponder {
+                    self.book_pending = Some(best);
+                } else {
+                    println!("{}", best);
+                }
+                return;
+            }
+        }
+
         let (time, inc) = if self.pos.side == BLACK { (btime, binc) } else { (wtime, winc) };
         let delay = self.network_delay;
         if movetime > 0 {
@@ -193,6 +251,10 @@ impl Engine {
             limits.soft_ms = budget.soft_ms;
             limits.hard_ms = budget.hard_ms;
             limits.adaptive_time = self.balanced_time && inc > 0 && byoyomi == 0;
+            // 実験T2（cargo の機能 ponder_bonus）：Ponder を使う対局では、当たった手が早く終わって時間が余るので、soft を 1.25 倍（hard まで）にする
+            if cfg!(feature = "ponder_bonus") && self.usi_ponder {
+                limits.soft_ms = (limits.soft_ms.saturating_mul(5) / 4).min(limits.hard_ms);
+            }
         }
 
         self.ensure_searcher();
@@ -246,6 +308,10 @@ fn main() {
         game_ply: 0,
         balanced_time: true,
         ponder_total: true,
+        usi_ponder: false,
+        use_book: true,
+        book_pending: None,
+        rng: (now_us() ^ 0x9E37_79B9_7F4A_7C15) | 1,
     };
 
     let stdin = io::stdin();
@@ -264,6 +330,13 @@ fn main() {
                 println!("option name MultiPV type spin default 1 min 1 max 10");
                 println!("option name Threads type spin default {} min 1 max 64", default_threads());
                 println!("option name UseNeuralNet type check default true");
+                // GUI は名乗ったオプションしか送らないことがあるので、実験T2 のビルドでは USI_Ponder を名乗る
+                if cfg!(feature = "ponder_bonus") {
+                    println!("option name USI_Ponder type check default false");
+                }
+                if cfg!(feature = "book") {
+                    println!("option name UseBook type check default true");
+                }
                 println!("usiok");
             }
             "setoption" => engine.setoption(&tokens),
@@ -286,6 +359,7 @@ fn main() {
                 engine.go(&tokens);
             }
             "stop" => engine.stop(),
+            "ponderhit" if engine.book_pending.is_some() => engine.flush_book_pending(),
             "ponderhit" => {
                 // 打ち切りの上限は、自分の時計が動き出したこの時点から数える
                 let now = now_us();
@@ -301,7 +375,10 @@ fn main() {
                 }
                 engine.shared.ponder.store(false, Ordering::SeqCst);
             }
-            "gameover" => engine.stop(),
+            "gameover" => {
+                engine.book_pending = None;
+                engine.stop();
+            }
             "quit" => {
                 engine.stop();
                 break;
@@ -309,6 +386,41 @@ fn main() {
             // ---- デバッグ用コマンド ----
             "d" => print!("{}", engine.pos.display()),
             "eval" => println!("eval = {}", eval::evaluate(&engine.pos)),
+            // 手番の偏りの確認: 今の局面の静的評価と、駒を取らず・成らず・王手でない手を指した後の静的評価（符号を反転）を比べる
+            // 出力: evalgap hc <親> <子の最大> <子の中央値> nn <親> <子の最大> <子の中央値> moves <数>
+            "evalgap" => {
+                let st = |p: &Position| -> (i32, i32) {
+                    let nn = sailfish2::nn::global().map_or(0, |net| {
+                        let mut acc = sailfish2::nn::Acc::default();
+                        net.refresh(p, &mut acc);
+                        net.forward(&acc, p)
+                    });
+                    (eval::evaluate(p), nn)
+                };
+                let mut pos = engine.pos.clone();
+                let (h0, n0) = st(&pos);
+                let (mut hs, mut ns) = (Vec::new(), Vec::new());
+                for m in pos.legal_moves() {
+                    if mv_is_promo(m) || (!mv_is_drop(m) && pos.board[mv_to(m)] != 0) {
+                        continue;
+                    }
+                    pos.do_move(m);
+                    if !pos.in_check() {
+                        let (h, n) = st(&pos);
+                        hs.push(-h);
+                        ns.push(-n);
+                    }
+                    pos.undo_move();
+                }
+                hs.sort();
+                ns.sort();
+                if hs.is_empty() {
+                    println!("evalgap none");
+                } else {
+                    println!("evalgap hc {} {} {} nn {} {} {} moves {}", h0, hs[hs.len() - 1], hs[hs.len() / 2],
+                        n0, ns[ns.len() - 1], ns[ns.len() / 2], hs.len());
+                }
+            }
             // 評価の速さの計測: evalbench [回数]（今の局面で、手作りの評価・ネットワークの出力・差分更新の 1 回あたりの時間を出す）
             "evalbench" => {
                 use std::time::Instant;

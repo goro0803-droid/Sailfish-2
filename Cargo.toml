@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "2.4.0"
+version = "2.5.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
@@ -15,6 +15,9 @@ codegen-units = 1
 panic = "abort"
 
 [features]
+# 2.5 から既定で有効：連続王手の千日手（実験PC）・入玉宣言（CSA 27点法）・定跡（実験BK）・不安定なときの時間の延長（実験T1）。
+# 外すときは --no-default-features に、残すものを --features で付ける。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -26,3 +29,14 @@ h128 = []
 h256 = []
 # 入力を HalfKP 型（自玉の升 × 駒）にする（実験C2）。内蔵のネットは使えないので EvalFile で読む
 halfkp = []
+# 実験T（時間配分）：T1 最善手・評価が不安定なら soft の 1.25 倍まで次の反復を始める／T2 Ponder を使う対局で soft を 1.25 倍
+time_unstable = []
+ponder_bonus = []
+# 手の省略の診断：省略が起きる浅い局面を間引いて選び、省略せずに読んだ結果を SAILFISH_DIAG のファイルに書く（探索は遅くなる。対局には使わない）
+prune_diag = []
+# 定跡（実験BK）：book/default.db を埋め込み、UseBook（既定 true）を名乗る
+book = []
+# 連続王手の千日手を、王手をかけ続けた側の負けとして読む（既定では繰り返しはすべて引き分け）
+perpetual_check = []
+# 入玉宣言（CSA ルール、27点法）：条件を満たせば bestmove win を返し、探索でも宣言できる局面を勝ちと読む
+nyugyoku = []
