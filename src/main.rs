@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 2.5";
+const ENGINE_NAME: &str = "Sailfish 2.6";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
@@ -348,6 +348,7 @@ fn main() {
                 engine.ensure_searcher();
                 if let Some(s) = engine.searcher.as_mut() {
                     s.tt.clear();
+                    s.new_game();
                 }
             }
             "position" => {

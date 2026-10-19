@@ -88,6 +88,29 @@ pub const INF: i32 = 31000;
 pub const MATE: i32 = 30000;
 pub const MATE_BOUND: i32 = MATE - MAX_PLY as i32;
 
+/// 評価補正履歴の表の大きさ（手番ごと）と、補正の上限（点）
+const CORR_SIZE: usize = 1 << 14;
+const CORR_MAX: i32 = 150;
+
+/// 歩の配置（各筋の先手・後手の歩の段。二歩が無いので筋ごとに高々1枚）と手番から、補正の表の添字を作る
+fn corr_index(pos: &Position) -> usize {
+    let mut sig = [[0u64; 9]; 2];
+    for sq in 0..81 {
+        let p = pos.board[sq];
+        if p != 0 && type_of(p) == PAWN {
+            sig[color_of(p)][sq / 9] = (sq % 9) as u64 + 1;
+        }
+    }
+    let mut h = 0u64;
+    for c in 0..2 {
+        for f in 0..9 {
+            h = h.wrapping_mul(11).wrapping_add(sig[c][f]);
+        }
+    }
+    let i = (h.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - 14)) as usize;
+    pos.side * CORR_SIZE + i
+}
+
 /// 連続王手の千日手・入玉宣言で勝つときの値。評価値（±20000 まで）より大きく、詰みの値（MATE_BOUND 以上）より小さい。近いほど大きい
 #[inline]
 fn repetition_win(ply: usize) -> i32 {
@@ -211,6 +234,13 @@ pub struct Searcher {
     diag_noprune_ply: usize,
     diag_ctr: u64,
     diag_every: u64,
+    /// 評価補正履歴（cargo の機能 corrhist）：手番 × 歩の配置ごとの「探索の値 − 補正前の静的評価」（1/16 点単位）
+    corr: Vec<i32>,
+    /// 各 ply の補正前の静的評価と、表の添字
+    raw_evals: [i32; MAX_PLY + 2],
+    corr_idx: [usize; MAX_PLY + 2],
+    /// 記録：値が確定した局面での、補正前・補正後のずれの合計と件数
+    corr_stats: (u64, u64, u64),
     singular_probes: u64,
     singular_extensions: u64,
     nodes: u64,
@@ -315,6 +345,26 @@ impl TacticalThreats {
 }
 
 impl Searcher {
+    /// 静止探索（全幅の窓）の値と読み筋を返す（学習データづくり用、実験B3）。
+    /// 局面の手番から見た値。読み筋は pos に指さない（pos は元のまま返す）。
+    pub fn qsearch_pv(&mut self, pos: &mut Position) -> (i32, Vec<Move>) {
+        self.feat = FEAT.load(Ordering::Relaxed);
+        self.sync_eval_cache();
+        self.set_network(if self.feat & F_NN != 0 { nn::global() } else { None });
+        if let Some(nn) = &self.nn {
+            nn.refresh(pos, &mut self.accs[0]);
+        }
+        self.stopped = false;
+        self.nodes = 0;
+        let v = self.qsearch(pos, -INF, INF, 0, 0);
+        (v, self.pv[..self.pv_len[0]].to_vec())
+    }
+
+    /// 新しい対局：評価補正履歴の表を消す
+    pub fn new_game(&mut self) {
+        self.corr.iter_mut().for_each(|e| *e = 0);
+    }
+
     pub fn new(hash_mb: usize, shared: Arc<Shared>) -> Searcher {
         Searcher::with_tt(Arc::new(TT::new(hash_mb)), shared)
     }
@@ -344,6 +394,10 @@ impl Searcher {
             diag_verifying: false,
             diag_noprune_ply: usize::MAX,
             diag_ctr: 0,
+            corr: if cfg!(feature = "corrhist") { vec![0; 2 * CORR_SIZE] } else { Vec::new() },
+            raw_evals: [0; MAX_PLY + 2],
+            corr_idx: [0; MAX_PLY + 2],
+            corr_stats: (0, 0, 0),
             diag_every: std::env::var("SAILFISH_DIAG_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1),
             singular_probes: 0,
             singular_extensions: 0,
@@ -543,6 +597,12 @@ impl Searcher {
         self.wait_for_stop();
         if cfg!(feature = "prune_diag") {
             diag_flush();
+        }
+        if cfg!(feature = "corrhist") {
+            let (raw, cor, n) = std::mem::take(&mut self.corr_stats);
+            if n > 0 {
+                println!("info string corrhist n {} raw {:.1} corrected {:.1}", n, raw as f64 / n as f64, cor as f64 / n as f64);
+            }
         }
         if ponder != MOVE_NONE {
             println!("bestmove {} ponder {}", move_to_usi(best), move_to_usi(ponder));
@@ -866,7 +926,14 @@ impl Searcher {
         // ここから先でこの局面のアキュムレータが要る（評価と、子の局面への更新の元になる）
         self.ensure_acc(pos, ply);
         let in_check = pos.in_check();
-        let static_eval = if in_check { -INF } else { self.eval(pos, ply) };
+        let mut static_eval = if in_check { -INF } else { self.eval(pos, ply) };
+        // 評価補正履歴（cargo の機能 corrhist）：補正前の値と添字を控え、表の値を足す
+        if cfg!(feature = "corrhist") && !in_check && static_eval.abs() < MATE_BOUND {
+            let idx = corr_index(pos);
+            self.raw_evals[ply] = static_eval;
+            self.corr_idx[ply] = idx;
+            static_eval = (static_eval + self.corr[idx] / 16).clamp(-20000, 20000);
+        }
         self.static_evals[ply] = static_eval;
         // 2 手前（自分の手番）より評価値が良くなっているか（わからないときは良くなっている扱い）
         let imp_on = self.feat & F_IMPROVING != 0;
@@ -1123,6 +1190,26 @@ impl Searcher {
         } else {
             BOUND_UPPER
         };
+        // 評価補正履歴を覚える（向きの合わない限界値、駒を取る手が最善、詰みの値は使わない）
+        if cfg!(feature = "corrhist") && excluded == MOVE_NONE && !in_check
+            && best.abs() < MATE_BOUND && static_eval.abs() < MATE_BOUND
+            && !(best_move != MOVE_NONE && !mv_is_drop(best_move) && pos.board[mv_to(best_move)] != 0)
+            && !(flag == BOUND_LOWER && best <= static_eval)
+            && !(flag == BOUND_UPPER && best >= static_eval)
+        {
+            let raw = self.raw_evals[ply];
+            let idx = self.corr_idx[ply];
+            if flag == BOUND_EXACT {
+                let s = &mut self.corr_stats;
+                s.0 += (best - raw).unsigned_abs() as u64;
+                s.1 += (best - static_eval).unsigned_abs() as u64;
+                s.2 += 1;
+            }
+            let target = (best - raw).clamp(-CORR_MAX, CORR_MAX) * 16;
+            let w = (depth + 1).clamp(1, 16) * 8;
+            let e = &mut self.corr[idx];
+            *e += (target - *e) * w / 1024;
+        }
         if excluded == MOVE_NONE {
             self.tt.store(key, best_move, score_to_tt(best, ply), depth, flag);
         }
@@ -1190,7 +1277,10 @@ impl Searcher {
             best = -INF;
             pos.gen_moves(&mut list, false);
         } else {
-            let stand = self.eval(pos, ply);
+            let mut stand = self.eval(pos, ply);
+            if cfg!(feature = "corrhist") && stand.abs() < MATE_BOUND {
+                stand = (stand + self.corr[corr_index(pos)] / 16).clamp(-20000, 20000);
+            }
             if stand >= beta {
                 return stand;
             }

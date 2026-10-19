@@ -1,6 +1,7 @@
 //! めきっと氏の公開教師データ（PackedSfenValue）から、nn_train --psv 用の学習・検証ファイルを作る（全件をメモリに載せない）。
 //!
-//! 使い方: psv_prepare <教師.bin> <出力フォルダ> [--max-accepted N] [--score-limit 3000] [--threads 8]
+//! 使い方: psv_prepare <教師.bin> <出力フォルダ> [--max-accepted N] [--score-limit 3000] [--threads 8] [--nonquiet]
+//! --nonquiet なら、採用した局面のうち静かでないものも train_nonquiet.psv / validation_nonquiet.psv に書く（実験B3）。
 //!
 //! 選び方は tools/convert-mekitto-tsv.py と同じ（ファイルは元々シャッフル済みなので先頭から読む）:
 //!   - 不正な手・勝敗があれば中止。手数16未満、王手がかかっている局面、|評価値| > 上限 を除外。
@@ -67,13 +68,14 @@ fn read_block(f: &mut impl Read, buf: &mut Vec<u8>) -> usize {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut pos_args = vec![];
-    let (mut max_accepted, mut limit, mut threads) = (None::<u64>, 3000i32, 8usize);
+    let (mut max_accepted, mut limit, mut threads, mut nonquiet) = (None::<u64>, 3000i32, 8usize, false);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--max-accepted" => { max_accepted = Some(args[i + 1].parse().unwrap()); i += 2; }
             "--score-limit" => { limit = args[i + 1].parse().unwrap(); i += 2; }
             "--threads" => { threads = args[i + 1].parse().unwrap(); i += 2; }
+            "--nonquiet" => { nonquiet = true; i += 1; }
             _ => { pos_args.push(args[i].clone()); i += 1; }
         }
     }
@@ -152,6 +154,14 @@ fn main() {
             BufWriter::with_capacity(1 << 22, File::create(out.join("train.psv")).unwrap()),
             BufWriter::with_capacity(1 << 22, File::create(out.join("validation.psv")).unwrap()),
         ];
+        let mut wn = if nonquiet {
+            Some([
+                BufWriter::with_capacity(1 << 22, File::create(out.join("train_nonquiet.psv")).unwrap()),
+                BufWriter::with_capacity(1 << 22, File::create(out.join("validation_nonquiet.psv")).unwrap()),
+            ])
+        } else {
+            None
+        };
         let mut rec = [0u8; RECORD_BYTES];
         let mut accepted = 0u64;
         for &flag in &flags {
@@ -167,10 +177,14 @@ fn main() {
             if flag & QUIET != 0 {
                 *c.entry(["trainQuiet", "validationQuiet"][val]).or_default() += 1;
                 w[val].write_all(&rec).unwrap();
+            } else if let Some(wn) = wn.as_mut() {
+                *c.entry(["trainNonQuiet", "validationNonQuiet"][val]).or_default() += 1;
+                wn[val].write_all(&rec).unwrap();
             }
         }
         *c.entry("accepted").or_default() = accepted;
         for x in &mut w { x.flush().unwrap(); }
+        if let Some(wn) = wn.as_mut() { for x in wn.iter_mut() { x.flush().unwrap(); } }
         if let Some(m) = max_accepted {
             if accepted < m { panic!("採用が {} に届きません（{}）", m, accepted); }
         }

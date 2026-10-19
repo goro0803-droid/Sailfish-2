@@ -79,6 +79,58 @@ pub fn unpack_sfen(data: &[u8]) -> Result<Position, String> {
     Ok(Position::from_parts(board, hand, side))
 }
 
+/// 局面を32バイトの圧縮した形にする（unpack_sfen の逆。駒が40枚そろっていれば、ちょうど256ビットになる）
+pub fn pack_sfen(pos: &Position) -> Result<[u8; 32], String> {
+    let mut data = [0u8; 32];
+    let mut cursor = 0usize;
+    let mut put = |v: u32, n: u32, cursor: &mut usize| -> Result<(), String> {
+        for i in 0..n {
+            if *cursor >= 256 { return Err("圧縮した局面が256ビットを超える".into()); }
+            if (v >> i) & 1 == 1 { data[*cursor / 8] |= 1 << (*cursor & 7); }
+            *cursor += 1;
+        }
+        Ok(())
+    };
+    put(pos.side as u32, 1, &mut cursor)?;
+    for c in 0..2 {
+        if pos.king[c] >= 81 { return Err("玉がない".into()); }
+        put(pos.king[c] as u32, 7, &mut cursor)?;
+    }
+    for sq in 0..81 {
+        let p = pos.board[sq];
+        if p != 0 && type_of(p) == KING { continue; }
+        if p == 0 { put(HUFFMAN[0].0, HUFFMAN[0].1, &mut cursor)?; continue; }
+        let pt = type_of(p);
+        let base = unpromote(pt);
+        put(HUFFMAN[base as usize].0, HUFFMAN[base as usize].1, &mut cursor)?;
+        if base != GOLD { put((pt > KING) as u32, 1, &mut cursor)?; }
+        put(color_of(p) as u32, 1, &mut cursor)?;
+    }
+    for c in 0..2 {
+        for pt in PAWN..=GOLD {
+            for _ in 0..pos.hand[c][pt as usize] {
+                let (code, bits) = HUFFMAN[pt as usize];
+                put(code >> 1, bits - 1, &mut cursor)?;
+                if pt != GOLD { put(0, 1, &mut cursor)?; }
+                put(c as u32, 1, &mut cursor)?;
+            }
+        }
+    }
+    if cursor != 256 { return Err(format!("圧縮した局面が256ビットにならない（{}ビット）", cursor)); }
+    Ok(data)
+}
+
+/// 40バイトの教師局面を作る（decode の逆）
+pub fn encode(pos: &Position, score: i16, move16: u16, ply: u16, result: i8) -> Result<[u8; RECORD_BYTES], String> {
+    let mut rec = [0u8; RECORD_BYTES];
+    rec[..32].copy_from_slice(&pack_sfen(pos)?);
+    rec[32..34].copy_from_slice(&score.to_le_bytes());
+    rec[34..36].copy_from_slice(&move16.to_le_bytes());
+    rec[36..38].copy_from_slice(&ply.to_le_bytes());
+    rec[38] = result as u8;
+    Ok(rec)
+}
+
 /// 40バイトの教師局面を読む
 pub fn decode(rec: &[u8]) -> Result<PsvRecord, String> {
     if rec.len() != RECORD_BYTES { return Err("教師局面の長さが40バイトではない".into()); }
@@ -199,6 +251,22 @@ mod tests {
         assert_eq!(hex(sha256(b"abc")), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
         let long = vec![b'a'; 1000];
         assert_eq!(hex(sha256(&long)), "41edece42d63e8d9bf515a9ba6932e1c20cbc9f5a5d134645adb5db1b9737ea3");
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        for sfen in [
+            "ln1g+R4/1+L5p1/p1p1pp1gp/3p5/1k4P2/2sP1S+B1P/PP1nPPN1n/1K7/5B1+r1 w 2GSL3Pslp 1",
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1",
+            "l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w RGgsn5p 1",
+        ] {
+            let pos = Position::from_sfen(sfen).unwrap();
+            let rec = encode(&pos, -123, 0, 77, -1).unwrap();
+            let r = decode(&rec).unwrap();
+            assert_eq!(sfen_key(&r.pos, false), sfen_key(&pos, false));
+            assert_eq!((r.score, r.move16, r.ply, r.result), (-123, 0, 77, -1));
+            assert_eq!(r.pos.key, pos.key);
+        }
     }
 
     #[test]
