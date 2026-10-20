@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "2.6.0"
+version = "2.7.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
@@ -42,3 +42,5 @@ perpetual_check = []
 nyugyoku = []
 # 評価補正履歴（実験CH）：手番 × 歩の配置ごとに、探索の値と静的評価のずれを覚えて静的評価を補正する
 corrhist = []
+# 実験T4：41手目以降で残り時間が加算の10手分より多いなら soft を 1.5 倍にする
+time_bank = []

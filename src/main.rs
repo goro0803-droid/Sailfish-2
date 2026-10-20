@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 2.6";
+const ENGINE_NAME: &str = "Sailfish 2.7";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
@@ -254,6 +254,13 @@ impl Engine {
             // 実験T2（cargo の機能 ponder_bonus）：Ponder を使う対局では、当たった手が早く終わって時間が余るので、soft を 1.25 倍（hard まで）にする
             if cfg!(feature = "ponder_bonus") && self.usi_ponder {
                 limits.soft_ms = (limits.soft_ms.saturating_mul(5) / 4).min(limits.hard_ms);
+            }
+            // 実験T4（cargo の機能 time_bank）：41手目以降で、残り時間が加算の10手分より多い（時間がたまっている）なら、
+            // soft を 1.5 倍（hard まで）にして中盤を長く考える。hard は変えない
+            if cfg!(feature = "time_bank") && self.balanced_time && inc > 0 && byoyomi == 0
+                && self.game_ply >= 40 && time > inc.saturating_mul(10)
+            {
+                limits.soft_ms = (limits.soft_ms.saturating_mul(3) / 2).min(limits.hard_ms);
             }
         }
 
