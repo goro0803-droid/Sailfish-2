@@ -6,7 +6,7 @@ use crate::nn::{self, Acc, Network};
 use crate::position::{MoveList, Position, CAPTURE_VALUE, MAX_MOVES};
 use crate::tt::*;
 use crate::types::*;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -79,6 +79,35 @@ fn threatens_enemy_piece(pos: &Position, sq: usize) -> bool {
         }
     }
     false
+}
+
+/// 実験SPSA（cargo の機能 tune）：探索の値。USI の隠しオプション T_0〜T_15 で変える。機能が無効なら既定の値を使う。
+/// 0 RFP の幅／1 RFP の深さの上限／2 futility の基本の幅／3 futility の幅（1手あたり）／4 futility の深さの上限／
+/// 5 LMP の基本の手数／6 LMP の手数（深さ²あたり）／7 LMP の深さの上限／8 ヌルムーブで減らす基本／9 ヌルムーブの深さの割り算／
+/// 10 LMR の基本（×100）／11 LMR の割り算（×100）／12 LMR のヒストリーの境目／13 アスピレーションの幅／
+/// 14 静止探索の駒取りの余裕／15 ヒストリーの加点の上限
+pub const TUNE_DEFAULT: [i32; 16] = [150, 3, 110, 100, 3, 4, 3, 3, 2, 4, 75, 225, 4000, 60, 200, 400];
+pub static TUNE: [AtomicI32; 16] = [
+    AtomicI32::new(150), AtomicI32::new(3), AtomicI32::new(110), AtomicI32::new(100),
+    AtomicI32::new(3), AtomicI32::new(4), AtomicI32::new(3), AtomicI32::new(3),
+    AtomicI32::new(2), AtomicI32::new(4), AtomicI32::new(75), AtomicI32::new(225),
+    AtomicI32::new(4000), AtomicI32::new(60), AtomicI32::new(200), AtomicI32::new(400),
+];
+
+#[inline]
+fn tp(i: usize) -> i32 {
+    if cfg!(feature = "tune") { TUNE[i].load(Ordering::Relaxed) } else { TUNE_DEFAULT[i] }
+}
+
+/// LMR で浅くする量の表 [深さ][何手目]
+fn lmr_table() -> Vec<i32> {
+    let (base, div) = (tp(10) as f64 / 100.0, (tp(11) as f64 / 100.0).max(0.1));
+    (0..64 * 64)
+        .map(|i| {
+            let (d, m) = ((i / 64) as f64, (i % 64) as f64);
+            if d < 1.0 || m < 1.0 { 0 } else { (base + d.ln() * m.ln() / div) as i32 }
+        })
+        .collect()
 }
 
 const ECACHE_BITS: usize = 18;
@@ -250,6 +279,16 @@ pub struct Searcher {
     history: Vec<i32>,
     /// 直前の相手の手（駒と行き先）に対してよく効いた応手
     counter: Vec<Move>,
+    /// 実験S4（cargo の機能 s_conthist）：継続ヒストリー [1手前・2手前の (駒, 行き先)][(駒, 行き先)]
+    cont: Vec<i16>,
+    /// 実験S5（cargo の機能 s_caphist）：駒取りヒストリー [(駒, 行き先)][取った駒の種類]
+    caph: Vec<i16>,
+    /// 各 ply で指した手の (駒, 行き先)。null move は (0, 0)（継続ヒストリーの添字）
+    ss_pm: [(u8, usize); MAX_PLY + 2],
+    ts: TreeStats,
+    /// 診断（cargo の機能 prof）：欄ごとのクロック数と回数
+    prof: [std::cell::Cell<u64>; 17],
+    prof_n: [std::cell::Cell<u64>; 17],
     /// 読みを浅くする量の表 [深さ][何手目]
     lmr: Vec<i32>,
     pv: Vec<Move>,
@@ -257,6 +296,115 @@ pub struct Searcher {
 }
 
 const PV_STRIDE: usize = MAX_PLY + 2;
+
+/// 診断（cargo の機能 prof）：式にかかった CPU のクロック数を、欄 i に足す（機能が無効なら式をそのまま返す）
+/// 欄：0 手の生成（通常）／1 手の生成（静止探索）／2 並べ替えの点数づけ／3 指す（合法の確認こみ）／4 戻す／5 王手になるかの判定／
+/// 6 SEE／7 アキュムレータの更新／8 評価／9 置換表を引く／10 置換表に書く／11 千日手の判定／12 入玉宣言の判定／13 手を選ぶ／14 思考の全体／
+/// 15 LMP・futility で省いた手を戻す（指す方は 3 に入る）／16 手作りの評価（覚えておいた値が使えず計算した分。8 の内数）
+macro_rules! prof {
+    ($s:expr, $i:expr, $e:expr) => {{
+        if cfg!(feature = "prof") {
+            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            let r = $e;
+            let dt = unsafe { core::arch::x86_64::_rdtsc() } - t0;
+            $s.prof[$i].set($s.prof[$i].get() + dt);
+            $s.prof_n[$i].set($s.prof_n[$i].get() + 1);
+            r
+        } else {
+            $e
+        }
+    }};
+}
+
+/// tree_stats のときだけ数を1足す（機能が無効なら何もしない）
+macro_rules! ts {
+    ($s:expr, $f:ident) => {
+        if cfg!(feature = "tree_stats") {
+            $s.ts.$f += 1;
+        }
+    };
+    ($s:expr, $f:ident, $n:expr) => {
+        if cfg!(feature = "tree_stats") {
+            $s.ts.$f += $n as u64;
+        }
+    };
+}
+
+/// 診断（cargo の機能 tree_stats）：読みの木の形を数える。思考の終わりに info string で出す
+#[derive(Default, Clone, Copy)]
+struct TreeStats {
+    /// 通常の探索・静止探索の局面数、静止探索のうち王手をかけられた局面
+    main: u64,
+    qs: u64,
+    qs_check: u64,
+    /// 置換表に載っていた局面、それで打ち切った局面
+    tt_hit: u64,
+    tt_cut: u64,
+    /// 局面ごと打ち切り：RFP、ヌルムーブ（試した数・打ち切った数）
+    rfp: u64,
+    null_try: u64,
+    null_cut: u64,
+    /// 手ごとの省略：LMP、futility
+    lmp: u64,
+    fut: u64,
+    /// β カットした局面、1手目でカットした局面、カットまでに読んだ手の合計
+    cut: u64,
+    cut_first: u64,
+    cut_moves: u64,
+    /// どの手も α を超えなかった局面
+    all_nodes: u64,
+    /// 読んだ手の合計（通常の探索）
+    moves: u64,
+    /// 王手の延長、LMR で浅くした手、LMR の読み直し、PVS の読み直し
+    ext_check: u64,
+    lmr: u64,
+    lmr_re: u64,
+    pvs_re: u64,
+    /// 静止探索：その場で打ち切った局面（stand pat）、5手目より先の局面、読んだ手（王手をかけられていない局面・王手をかけられた局面）
+    qs_standpat: u64,
+    qs_deep: u64,
+    qs_moves: u64,
+    qs_evasions: u64,
+    /// 静止探索で、王手をかけられていない局面のうち、3手目以降の駒取りまで読んだ局面
+    qs_over2: u64,
+    /// 残りの深さごと（入ったときの depth、23 以上は 23 にまとめる）：局面数、置換表で打ち切り、RFP、ヌルムーブで打ち切り、
+    /// 読んだ手、読んだ手のうち LMR で浅くした手、浅くした量の合計、子の深さが親以上になった手（延長）
+    d_main: [u64; 24],
+    d_tt_cut: [u64; 24],
+    d_rfp: [u64; 24],
+    d_null_cut: [u64; 24],
+    d_moves: [u64; 24],
+    d_lmr: [u64; 24],
+    d_red: [u64; 24],
+    d_ext: [u64; 24],
+    /// どの手も α を超えなかった局面の数と、そこで読んだ手・省いた手の合計
+    d_all: [u64; 24],
+    d_all_moves: [u64; 24],
+    d_all_pruned: [u64; 24],
+}
+
+/// tree_stats のときだけ、残りの深さ d の欄に数を足す
+macro_rules! tsd {
+    ($s:expr, $f:ident, $d:expr) => {
+        if cfg!(feature = "tree_stats") {
+            $s.ts.$f[($d).clamp(0, 23) as usize] += 1;
+        }
+    };
+    ($s:expr, $f:ident, $d:expr, $n:expr) => {
+        if cfg!(feature = "tree_stats") {
+            $s.ts.$f[($d).clamp(0, 23) as usize] += $n as u64;
+        }
+    };
+}
+/// (駒, 行き先) の数（ヒストリーの添字の大きさ）
+const PT: usize = 32 * 81;
+
+/// ヒストリーの値を、上限 16384 に向かって縮めながら b だけ動かす
+#[inline]
+fn hist_update(h: &mut i16, b: i32) {
+    let v = *h as i32;
+    *h = (v + b - v * b.abs() / 16384) as i16;
+}
 
 #[inline]
 fn score_to_tt(s: i32, ply: usize) -> i32 {
@@ -407,12 +555,13 @@ impl Searcher {
             killers: [[MOVE_NONE; 2]; MAX_PLY + 2],
             history: vec![0; 32 * 81],
             counter: vec![MOVE_NONE; 32 * 81],
-            lmr: (0..64 * 64)
-                .map(|i| {
-                    let (d, m) = ((i / 64) as f64, (i % 64) as f64);
-                    if d < 1.0 || m < 1.0 { 0 } else { (0.75 + d.ln() * m.ln() / 2.25) as i32 }
-                })
-                .collect(),
+            cont: if cfg!(feature = "s_conthist") { vec![0; PT * PT] } else { Vec::new() },
+            caph: if cfg!(feature = "s_caphist") { vec![0; PT * 16] } else { Vec::new() },
+            ss_pm: [(0, 0); MAX_PLY + 2],
+            ts: TreeStats::default(),
+            prof: Default::default(),
+            prof_n: Default::default(),
+            lmr: lmr_table(),
             pv: vec![MOVE_NONE; PV_STRIDE * PV_STRIDE],
             pv_len: [0; MAX_PLY + 2],
         }
@@ -430,6 +579,16 @@ impl Searcher {
     /// NN の土台の手作り評価だけを再利用する。差分更新の浮動小数点値はキャッシュしない。
     #[inline]
     fn eval(&mut self, pos: &Position, ply: usize) -> i32 {
+        prof!(self, 8, self.eval_inner(pos, ply))
+    }
+
+    #[inline]
+    fn eval_inner(&mut self, pos: &Position, ply: usize) -> i32 {
+        // 診断（実験 diagSE）：外部の評価関数を読み込んでいれば、評価をまるごと置き換える
+        #[cfg(feature = "ext_eval")]
+        if let Some(ext) = crate::ext_eval::global() {
+            return ext.evaluate(pos);
+        }
         if self.feat & F_ECACHE != 0 && self.nn.as_ref().is_some_and(|net| net.base_hc) {
             let base = self.cached_base_eval(pos);
             return self.nn.as_ref().unwrap().forward_with_base(&self.accs[ply], pos.side, base);
@@ -450,7 +609,7 @@ impl Searcher {
         if e.0 == pos.key && e.1 != i32::MIN {
             return e.1;
         }
-        let v = evaluate(pos);
+        let v = prof!(self, 16, evaluate(pos));
         self.ecache[i] = (pos.key, v);
         v
     }
@@ -510,6 +669,11 @@ impl Searcher {
     /// この ply の局面（pos）のアキュムレータを、一つ前の ply のものと控えておいた手から作る
     #[inline]
     fn ensure_acc(&mut self, pos: &Position, ply: usize) {
+        prof!(self, 7, self.ensure_acc_inner(pos, ply))
+    }
+
+    #[inline]
+    fn ensure_acc_inner(&mut self, pos: &Position, ply: usize) {
         if ply == 0 {
             return;
         }
@@ -566,6 +730,11 @@ impl Searcher {
         self.sync_eval_cache();
         self.set_network(if self.feat & F_NN != 0 { nn::global() } else { None });
         self.history.iter_mut().for_each(|h| *h /= 4);
+        if cfg!(feature = "tune") {
+            self.lmr = lmr_table();
+        }
+        self.cont.iter_mut().for_each(|h| *h /= 2);
+        self.caph.iter_mut().for_each(|h| *h /= 2);
 
         let root_moves = pos.legal_moves();
         self.prepare_goal_moves(pos, &root_moves);
@@ -589,7 +758,7 @@ impl Searcher {
                     })
                     .expect("failed to spawn helper thread");
             }
-            let r = self.search(pos, &root_moves);
+            let r = prof!(self, 14, self.search(pos, &root_moves));
             self.shared.helpers_stop.store(true, Ordering::Relaxed);
             r
         });
@@ -597,6 +766,22 @@ impl Searcher {
         self.wait_for_stop();
         if cfg!(feature = "prune_diag") {
             diag_flush();
+        }
+        if cfg!(feature = "prof") {
+            let c = self.prof.iter().map(|x| x.take().to_string()).collect::<Vec<_>>().join(",");
+            let n = self.prof_n.iter().map(|x| x.take().to_string()).collect::<Vec<_>>().join(",");
+            println!("info string prof cycles {} calls {} nodes {}", c, n, self.nodes);
+        }
+        if cfg!(feature = "tree_stats") {
+            let t = std::mem::take(&mut self.ts);
+            println!("info string tree main {} qs {} qs_check {} tt_hit {} tt_cut {} rfp {} null_try {} null_cut {} lmp {} fut {} cut {} cut_first {} cut_moves {} all {} moves {} ext_check {} lmr {} lmr_re {} pvs_re {} qs_standpat {} qs_deep {} qs_moves {} qs_evasions {} qs_over2 {}",
+                t.main, t.qs, t.qs_check, t.tt_hit, t.tt_cut, t.rfp, t.null_try, t.null_cut, t.lmp, t.fut,
+                t.cut, t.cut_first, t.cut_moves, t.all_nodes, t.moves, t.ext_check, t.lmr, t.lmr_re, t.pvs_re,
+                t.qs_standpat, t.qs_deep, t.qs_moves, t.qs_evasions, t.qs_over2);
+            let j = |a: &[u64; 24]| a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+            println!("info string treed main {} tt_cut {} rfp {} null_cut {} moves {} lmr {} red {} ext {} all {} all_moves {} all_pruned {}",
+                j(&t.d_main), j(&t.d_tt_cut), j(&t.d_rfp), j(&t.d_null_cut), j(&t.d_moves), j(&t.d_lmr), j(&t.d_red), j(&t.d_ext),
+                j(&t.d_all), j(&t.d_all_moves), j(&t.d_all_pruned));
         }
         if cfg!(feature = "corrhist") {
             let (raw, cor, n) = std::mem::take(&mut self.corr_stats);
@@ -645,7 +830,7 @@ impl Searcher {
             self.sel_depth = 0;
 
             // アスピレーションウィンドウ
-            let mut delta = 60;
+            let mut delta = tp(13);
             let (mut alpha, mut beta) = if depth >= 4 && prev_score.abs() < MATE_BOUND {
                 (prev_score - delta, prev_score + delta)
             } else {
@@ -772,7 +957,7 @@ impl Searcher {
 
     #[inline]
     fn exchange_score(&self, pos: &Position, m: Move) -> i32 {
-        if self.feat & F_SEE_HAND != 0 { pos.see_with_hand(m) } else { pos.see(m) }
+        prof!(self, 6, if self.feat & F_SEE_HAND != 0 { pos.see_with_hand(m) } else { pos.see(m) })
     }
 
     // Only prioritize a hypothesis; the ordinary search must still refute it.
@@ -802,6 +987,23 @@ impl Searcher {
         }
     }
 
+    /// k 手前（この ply から見て）に指した手の (駒, 行き先) の添字。無ければ 0（null move と同じ番兵の行）
+    #[inline]
+    fn prev_pm(&self, ply: usize, k: usize) -> usize {
+        if ply >= k { let (p, t) = self.ss_pm[ply - k]; p as usize * 81 + t } else { 0 }
+    }
+
+    /// 静かな手のヒストリーの合計（駒×行き先、実験S4 では 1手前・2手前からの継続ヒストリーも足す）
+    #[inline]
+    fn quiet_stat(&self, piece: u8, to: usize, ply: usize) -> i32 {
+        let idx = piece as usize * 81 + to;
+        let mut s = self.history[idx];
+        if cfg!(feature = "s_conthist") {
+            s += self.cont[self.prev_pm(ply, 1) * PT + idx] as i32 + self.cont[self.prev_pm(ply, 2) * PT + idx] as i32;
+        }
+        s
+    }
+
     fn order_moves(&self, pos: &Position, list: &MoveList, scores: &mut [i32], tt_move: Move, ply: usize) {
         let counter = Self::counter_index(pos).map(|i| self.counter[i]).unwrap_or(MOVE_NONE);
         for i in 0..list.len {
@@ -811,7 +1013,12 @@ impl Searcher {
             } else if !mv_is_drop(m) && pos.board[mv_to(m)] != 0 {
                 let victim = PIECE_VALUE[type_of(pos.board[mv_to(m)]) as usize];
                 let attacker = PIECE_VALUE[type_of(pos.board[mv_from(m)]) as usize];
-                let base = victim * 16 - attacker / 16 + if mv_is_promo(m) { 1000 } else { 0 };
+                // 実験S5（cargo の機能 s_caphist）：取る駒の価値に、駒取りヒストリーを足す（取る側の駒の価値のかわり）
+                let tiebreak = if cfg!(feature = "s_caphist") {
+                    let idx = pos.board[mv_from(m)] as usize * 81 + mv_to(m);
+                    self.caph[idx * 16 + type_of(pos.board[mv_to(m)]) as usize] as i32 / 16
+                } else { -attacker / 16 };
+                let base = victim * 16 + tiebreak + if mv_is_promo(m) { 1000 } else { 0 };
                 // 取り合いで損をする駒取りは、静かな手より後ろに回す
                 let see = if self.feat & (F_SEE_HAND | F_SEE_HAND_ORDER) != 0 {
                     pos.see_with_hand(m)
@@ -834,19 +1041,17 @@ impl Searcher {
                 } else {
                     pos.board[mv_from(m)]
                 };
-                self.history[piece as usize * 81 + mv_to(m)]
+                self.quiet_stat(piece, mv_to(m), ply)
             };
         }
     }
 
     #[inline]
     fn pick_move(list: &mut MoveList, scores: &mut [i32], i: usize) -> Move {
-        let mut best = i;
-        for j in i + 1..list.len {
-            if scores[j] > scores[best] {
-                best = j;
-            }
-        }
+        // 残りの中で点数が最大の、最初の手（これまでと同じ決まり）。最大値を先にまとめて求めてから位置を探す（実験 V5）
+        let rest = &scores[i..list.len];
+        let max = rest.iter().copied().fold(i32::MIN, i32::max);
+        let best = i + rest.iter().position(|&s| s == max).unwrap_or(0);
         list.moves.swap(i, best);
         scores.swap(i, best);
         list.moves[i]
@@ -876,6 +1081,10 @@ impl Searcher {
             return self.qsearch(pos, alpha, beta, ply, 0);
         }
         self.nodes += 1;
+        ts!(self, main);
+        // 入ったときの残りの深さ（tree_stats の深さごとの欄）
+        let d0 = depth;
+        tsd!(self, d_main, d0);
         self.check_time();
         if self.stopped {
             return 0;
@@ -885,14 +1094,14 @@ impl Searcher {
         if ply > 0 {
             if cfg!(feature = "perpetual_check") {
                 // 連続王手の千日手は、王手をかけ続けた側の負け（それ以外の繰り返しは引き分け）
-                if let Some(r) = pos.repetition_result() {
+                if let Some(r) = prof!(self, 11, pos.repetition_result()) {
                     return r * repetition_win(ply);
                 }
             } else if pos.is_repetition() {
                 return 0;
             }
             // 入玉宣言（cargo の機能 nyugyoku）：手番側が宣言できる局面は勝ち
-            if cfg!(feature = "nyugyoku") && pos.can_declare() {
+            if cfg!(feature = "nyugyoku") && prof!(self, 12, pos.can_declare()) {
                 return repetition_win(ply);
             }
             // 詰み距離による枝刈り
@@ -909,15 +1118,18 @@ impl Searcher {
 
         let key = pos.key;
         let mut tt_move = MOVE_NONE;
-        let tt_entry = if excluded == MOVE_NONE { self.tt.probe(key) } else { None };
+        let tt_entry = if excluded == MOVE_NONE { prof!(self, 9, self.tt.probe(key)) } else { None };
         if let Some(e) = tt_entry {
             tt_move = e.mv;
+            ts!(self, tt_hit);
             if !pv_node && ply > 0 && e.depth as i32 >= depth {
                 let s = score_from_tt(e.score as i32, ply);
                 if e.flag == BOUND_EXACT
                     || (e.flag == BOUND_LOWER && s >= beta)
                     || (e.flag == BOUND_UPPER && s <= alpha)
                 {
+                    ts!(self, tt_cut);
+                    tsd!(self, d_tt_cut, d0);
                     return s;
                 }
             }
@@ -966,7 +1178,18 @@ impl Searcher {
                     diag_write(1, depth, rfp_depth, improving, static_eval - beta, v - beta);
                 }
             }
-            if self.feat & D_NO_RFP == 0 && ply != self.diag_noprune_ply && depth <= 3 && static_eval - 150 * rfp_depth >= beta && static_eval.abs() < MATE_BOUND {
+            // 実験S2（cargo の機能 s_prune）：やねうら王と同じく、残り8手まで・幅 214×(深さ − improving) で省略する
+            let rfp = if cfg!(feature = "s_prune") {
+                depth < 9 && static_eval - 214 * (depth - i32::from(improving)) >= beta
+            } else if cfg!(feature = "s_prune2") {
+                // 実験S6（cargo の機能 s_prune2）：幅はこれまでと同じ 150×深さのまま、深さ6まで広げる
+                depth <= 6 && static_eval - 150 * rfp_depth >= beta
+            } else {
+                depth <= tp(1) && static_eval - tp(0) * rfp_depth >= beta
+            };
+            if self.feat & D_NO_RFP == 0 && ply != self.diag_noprune_ply && rfp && static_eval.abs() < MATE_BOUND {
+                ts!(self, rfp);
+                tsd!(self, d_rfp, d0);
                 return static_eval;
             }
             // Null move pruning
@@ -974,9 +1197,11 @@ impl Searcher {
                 let r = if self.feat & F_NULL2 != 0 {
                     3 + depth / 3 + ((static_eval - beta) / 200).clamp(0, 2)
                 } else {
-                    2 + depth / 4
+                    tp(8) + depth / tp(9).max(1)
                 };
                 self.set_pending_null(ply);
+                self.ss_pm[ply] = (0, 0);
+                ts!(self, null_try);
                 pos.do_null();
                 let s = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, false);
                 pos.undo_null();
@@ -984,6 +1209,8 @@ impl Searcher {
                     return 0;
                 }
                 if s >= beta {
+                    ts!(self, null_cut);
+                    tsd!(self, d_null_cut, d0);
                     return if s >= MATE_BOUND { beta } else { s };
                 }
             }
@@ -1028,15 +1255,15 @@ impl Searcher {
             }
         }
 
-        // 王手延長
-        if in_check {
+        // 王手延長（実験S1、cargo の機能 s_check では、王手をかけられた局面ではなく、損をしない王手の手を延長する）
+        if in_check && !cfg!(feature = "s_check") {
             depth += 1;
         }
 
         let mut list = MoveList::new();
-        pos.gen_moves(&mut list, false);
+        prof!(self, 0, pos.gen_moves(&mut list, false));
         let mut scores = [0i32; MAX_MOVES];
-        self.order_moves(pos, &list, &mut scores, tt_move, ply);
+        prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
 
         let us = pos.side;
         let guard_on = self.feat & F_TACTICAL_GUARD != 0 && excluded == MOVE_NONE
@@ -1049,9 +1276,16 @@ impl Searcher {
         // 試して失敗した静かな手（β カット時にヒストリーを下げる）
         let mut quiets_tried = [(0u8, 0usize); 64];
         let mut n_quiets = 0;
+        // 実験S5：試した駒取り（駒, 行き先, 取った駒の種類）
+        let mut caps_tried = [(0u8, 0usize, 0u8); 32];
+        let mut n_caps = 0;
+        // 実験S2：指す前に省略した手の数（やねうら王の moveCount と同じく、省略した手も数える）
+        let mut pruned = 0;
+        // 実験S3：置換表の手が駒を取る手か
+        let tt_capture = tt_move != MOVE_NONE && !mv_is_drop(tt_move) && pos.board[mv_to(tt_move)] != 0;
 
         for i in 0..list.len {
-            let m = Self::pick_move(&mut list, &mut scores, i);
+            let m = prof!(self, 13, Self::pick_move(&mut list, &mut scores, i));
             if m == excluded { continue; }
             let to = mv_to(m);
             let is_cap = !mv_is_drop(m) && pos.board[to] != 0;
@@ -1062,21 +1296,63 @@ impl Searcher {
             if ply == 0 && self.root_excluded.contains(&m) {
                 continue;
             }
+            // 指す前の王手の判定は、実験S2・S6 のときだけ（S1 の延長は、指した後に王手かどうかで決める。実験 V6）
+            let pre_check = (cfg!(feature = "s_prune") || cfg!(feature = "s_prune2")) && prof!(self, 5, pos.gives_check(m));
+            // 実験S2（cargo の機能 s_prune）：指す前の省略（やねうら王の Step 13 と同じ考え方）
+            if cfg!(feature = "s_prune") && ply > 0 && excluded == MOVE_NONE && !in_check && best > -MATE_BOUND {
+                let mc = legal + pruned + 1;
+                if is_cap || is_promo || pre_check {
+                    // 取り合いで大きく損をする駒取り・成り・王手
+                    if self.exchange_score(pos, m) < -218 * depth {
+                        pruned += 1;
+                        continue;
+                    }
+                } else {
+                    let lmr_depth = (depth - 1 - self.lmr[(depth.min(63) as usize) * 64 + mc.min(63) as usize]).max(0);
+                    // 後半の静かな手・評価が α に届きそうにない静かな手・取り合いで損をする静かな手
+                    if mc >= (3 + depth * depth) / (2 - i32::from(improving))
+                        || (lmr_depth < 8 && static_eval + 172 + 145 * lmr_depth <= alpha)
+                        || self.exchange_score(pos, m) < -21 * lmr_depth * lmr_depth - 21 * lmr_depth
+                    {
+                        pruned += 1;
+                        continue;
+                    }
+                }
+            }
+            // 実験S6（cargo の機能 s_prune2）：S2 の軽い版。PV でない局面で、取り合いで大きく損をする手だけを指す前に省略する
+            if cfg!(feature = "s_prune2") && ply > 0 && !pv_node && excluded == MOVE_NONE && !in_check
+                && best > -MATE_BOUND && depth <= 6
+            {
+                let limit = if is_cap || is_promo || pre_check { -218 * depth } else if depth <= 4 { -21 * depth * depth - 21 * depth } else { i32::MIN };
+                if limit > i32::MIN && self.exchange_score(pos, m) < limit {
+                    continue;
+                }
+            }
             let escape = guard_on && quiet && !mv_is_drop(m)
                 && threats.hanging_from(pos, mv_from(m));
             let safe_reply = guard_on && quiet && (escape || threats.majors != 0)
                 && pos.see(m) >= 0;
             self.set_pending(pos, m, ply);
-            if !pos.do_move_legal(m) {
+            let cap_type = if is_cap { type_of(pos.board[to]) } else { 0 };
+            if !prof!(self, 3, pos.do_move_legal(m)) {
                 continue;
             }
             legal += 1;
+            self.ss_pm[ply] = (piece, to);
             let gives_check = pos.in_check();
+            // 実験S1：損をしない王手（SEE が 0 以上）を1手延長する。延長はルートの深さの2倍の ply まで。
+            // SEE は指す前の局面で調べるので、王手のときだけ戻して調べ、指し直す（実験 V6）
+            let check_ext = cfg!(feature = "s_check") && gives_check && ply < (2 * self.iteration_depth) as usize && {
+                pos.undo_move();
+                let ok = self.exchange_score(pos, m) >= 0;
+                pos.do_move(m);
+                ok
+            };
             let protected_reply = safe_reply && threats.protects_after(pos, us, escape);
             let threat_drop = self.feat & F_THREAT_DROP != 0 && mv_is_drop(m) && !gives_check
                 && threatens_enemy_piece(pos, to);
 
-            if !(protected_reply && self.feat & F_TACTICAL_PRUNE != 0)
+            if !cfg!(feature = "s_prune") && !(protected_reply && self.feat & F_TACTICAL_PRUNE != 0)
                 && excluded == MOVE_NONE && !pv_node && !in_check && !gives_check && quiet && best > -MATE_BOUND {
                 // 省略の診断：静的評価が α 以下の浅い局面の静かな手を、省略せずに読み、結果を記録する（SAILFISH_DIAG_EVERY 回に 1 回、既定 8）
                 if cfg!(feature = "prune_diag") && !self.diag_verifying && depth <= 3 && legal > 1
@@ -1095,15 +1371,26 @@ impl Searcher {
                     }
                 }
                 // Late move pruning（浅い深さでの後半の静かな手を省略）
-                let lmp_base = 4 + depth * depth * 3;
+                let lmp_base = tp(5) + depth * depth * tp(6);
                 let lmp_limit = if imp_on && !improving { lmp_base * 2 / 3 } else { lmp_base };
-                if self.feat & D_NO_LMP == 0 && depth <= 3 && legal > lmp_limit {
-                    pos.undo_move();
+                // 実験S10（cargo の機能 s_lmp）：やねうら王と同じ (3+d²)/(2−improving) 手目から省略（深さの上限なし）。
+                // 実験S11（s_lmp_mid）：今の 4+3d² とやねうら王の中間 (4+2d²)/(2−improving)
+                let lmp = if cfg!(feature = "s_lmp") {
+                    legal >= (3 + depth * depth) / (2 - i32::from(improving))
+                } else if cfg!(feature = "s_lmp_mid") {
+                    legal >= (4 + 2 * depth * depth) / (2 - i32::from(improving))
+                } else {
+                    depth <= tp(7) && legal > lmp_limit
+                };
+                if self.feat & D_NO_LMP == 0 && lmp {
+                    ts!(self, lmp);
+                    prof!(self, 15, pos.undo_move());
                     continue;
                 }
                 // Futility pruning（評価値が α に遠く届かない局面の静かな手を省略）
-                if self.feat & D_NO_FUTILITY == 0 && depth <= 3 && legal > 1 && static_eval + 110 + 100 * depth <= alpha {
-                    pos.undo_move();
+                if self.feat & D_NO_FUTILITY == 0 && depth <= tp(4) && legal > 1 && static_eval + tp(2) + tp(3) * depth <= alpha {
+                    ts!(self, fut);
+                    prof!(self, 15, pos.undo_move());
                     continue;
                 }
             }
@@ -1111,38 +1398,62 @@ impl Searcher {
                 quiets_tried[n_quiets] = (piece, to);
                 n_quiets += 1;
             }
+            if cfg!(feature = "s_caphist") && is_cap && n_caps < 32 {
+                caps_tried[n_caps] = (piece, to, cap_type);
+                n_caps += 1;
+            }
 
-            let new_depth = depth - 1 + i32::from(m == singular_move);
+            let new_depth = depth - 1 + i32::from(m == singular_move || check_ext);
+            if check_ext { ts!(self, ext_check); }
+            ts!(self, moves);
+            tsd!(self, d_moves, d0);
+            if new_depth >= d0 { tsd!(self, d_ext, d0); }
             let mut s;
             if legal == 1 {
                 s = -self.negamax(pos, -beta, -alpha, new_depth, ply + 1, true);
             } else {
                 let mut r = 0;
-                if excluded == MOVE_NONE && self.feat & D_NO_LMR == 0 && depth >= 3 && legal > 2 && quiet && !in_check && !gives_check {
-                    r = self.lmr[(depth.min(63) as usize) * 64 + legal.min(63) as usize];
+                let lmr_from = if cfg!(feature = "s_lmr") { 1 } else { 2 };
+                if excluded == MOVE_NONE && self.feat & D_NO_LMR == 0 && depth >= 3 && legal > lmr_from && quiet && !in_check && !gives_check {
+                    let mc = if cfg!(feature = "s_prune") { legal + pruned } else { legal };
+                    r = self.lmr[(depth.min(63) as usize) * 64 + mc.min(63) as usize];
                     if pv_node {
                         r -= 1;
                     }
                     if imp_on && !improving {
                         r += 1;
                     }
-                    // ヒストリーの良い手は浅くしすぎない
-                    if self.history[piece as usize * 81 + to] > 4000 {
+                    if cfg!(feature = "s_lmr") {
+                        // 実験S3（cargo の機能 s_lmr）：PV でない局面・置換表の手が駒取りの局面では深めに減らし、
+                        // ヒストリーの良し悪しに応じて減らす量を連続的に変える（やねうら王の cutNode・ttCapture・statScore の考え方）
+                        if !pv_node {
+                            r += 1;
+                        }
+                        if tt_capture {
+                            r += 1;
+                        }
+                        let div = if cfg!(feature = "s_conthist") { 16384 } else { 8192 };
+                        r -= self.quiet_stat(piece, to, ply) / div;
+                    } else if self.history[piece as usize * 81 + to] > tp(12) {
+                        // ヒストリーの良い手は浅くしすぎない
                         r -= 1;
                     }
                     if protected_reply { r -= 1; }
                     if threat_drop { r -= 1; }
                     r = r.clamp(0, (new_depth - 1).max(0));
                 }
+                if r > 0 { ts!(self, lmr); tsd!(self, d_lmr, d0); tsd!(self, d_red, d0, r); }
                 s = -self.negamax(pos, -alpha - 1, -alpha, new_depth - r, ply + 1, true);
                 if s > alpha && r > 0 {
+                    ts!(self, lmr_re);
                     s = -self.negamax(pos, -alpha - 1, -alpha, new_depth, ply + 1, true);
                 }
                 if s > alpha && s < beta {
+                    ts!(self, pvs_re);
                     s = -self.negamax(pos, -beta, -alpha, new_depth, ply + 1, true);
                 }
             }
-            pos.undo_move();
+            prof!(self, 4, pos.undo_move());
             if self.stopped {
                 return 0;
             }
@@ -1154,6 +1465,18 @@ impl Searcher {
                     alpha = s;
                     if excluded == MOVE_NONE { self.update_pv(ply, m); }
                     if s >= beta {
+                        ts!(self, cut);
+                        ts!(self, cut_moves, legal);
+                        if legal == 1 { ts!(self, cut_first); }
+                        // 実験S5：カットした駒取りを上げ、先に試して失敗した駒取りを下げる
+                        if cfg!(feature = "s_caphist") && excluded == MOVE_NONE {
+                            let bonus = (depth * depth).min(tp(15));
+                            for k in 0..n_caps {
+                                let (p, t, c) = caps_tried[k];
+                                let b = if is_cap && p == piece && t == to { bonus } else { -bonus };
+                                hist_update(&mut self.caph[(p as usize * 81 + t) * 16 + c as usize], b);
+                            }
+                        }
                         if quiet && excluded == MOVE_NONE {
                             if self.killers[ply][0] != m {
                                 self.killers[ply][1] = self.killers[ply][0];
@@ -1163,12 +1486,22 @@ impl Searcher {
                                 self.counter[ci] = m;
                             }
                             // ヒストリー: カットした手を上げ、先に試して失敗した手を下げる
-                            let bonus = (depth * depth).min(400);
+                            let bonus = (depth * depth).min(tp(15));
                             for k in 0..n_quiets {
                                 let (p, t) = quiets_tried[k];
                                 let h = &mut self.history[p as usize * 81 + t];
                                 let b = if p == piece && t == to { bonus } else { -bonus };
                                 *h += b - *h * b.abs() / 16384;
+                                // 実験S4：1手前・2手前の手からの継続ヒストリーも同じように動かす
+                                if cfg!(feature = "s_conthist") {
+                                    let idx = p as usize * 81 + t;
+                                    for k2 in 1..=2 {
+                                        if ply >= k2 {
+                                            let c = self.prev_pm(ply, k2) * PT + idx;
+                                            hist_update(&mut self.cont[c], b);
+                                        }
+                                    }
+                                }
                             }
                         }
                         break;
@@ -1190,6 +1523,12 @@ impl Searcher {
         } else {
             BOUND_UPPER
         };
+        if flag == BOUND_UPPER {
+            ts!(self, all_nodes);
+            tsd!(self, d_all, d0);
+            tsd!(self, d_all_moves, d0, legal);
+            tsd!(self, d_all_pruned, d0, list.len as i32 - legal);
+        }
         // 評価補正履歴を覚える（向きの合わない限界値、駒を取る手が最善、詰みの値は使わない）
         if cfg!(feature = "corrhist") && excluded == MOVE_NONE && !in_check
             && best.abs() < MATE_BOUND && static_eval.abs() < MATE_BOUND
@@ -1211,7 +1550,7 @@ impl Searcher {
             *e += (target - *e) * w / 1024;
         }
         if excluded == MOVE_NONE {
-            self.tt.store(key, best_move, score_to_tt(best, ply), depth, flag);
+            prof!(self, 10, self.tt.store(key, best_move, score_to_tt(best, ply), depth, flag));
         }
         best
     }
@@ -1219,12 +1558,14 @@ impl Searcher {
     fn qsearch(&mut self, pos: &mut Position, mut alpha: i32, beta: i32, ply: usize, qdepth: usize) -> i32 {
         self.pv_len[ply] = 0;
         self.nodes += 1;
+        ts!(self, qs);
+        if qdepth >= 5 { ts!(self, qs_deep); }
         self.check_time();
         if self.stopped {
             return 0;
         }
         self.sel_depth = self.sel_depth.max(ply);
-        if cfg!(feature = "nyugyoku") && ply > 0 && pos.can_declare() {
+        if cfg!(feature = "nyugyoku") && ply > 0 && prof!(self, 12, pos.can_declare()) {
             return repetition_win(ply);
         }
         if ply >= MAX_PLY - 4 {
@@ -1247,7 +1588,7 @@ impl Searcher {
         let use_tt = self.feat & F_QS_TT != 0 && !extra_checks && !mate_probe;
         let mut tt_move = MOVE_NONE;
         if use_tt {
-            if let Some(e) = self.tt.probe(key) {
+            if let Some(e) = prof!(self, 9, self.tt.probe(key)) {
                 tt_move = e.mv;
                 if !pv_node {
                     let s = score_from_tt(e.score as i32, ply);
@@ -1274,27 +1615,33 @@ impl Searcher {
         let mut list = MoveList::new();
         let mut best;
         if in_check {
+            ts!(self, qs_check);
             best = -INF;
-            pos.gen_moves(&mut list, false);
+            prof!(self, 1, pos.gen_moves(&mut list, false));
         } else {
             let mut stand = self.eval(pos, ply);
             if cfg!(feature = "corrhist") && stand.abs() < MATE_BOUND {
                 stand = (stand + self.corr[corr_index(pos)] / 16).clamp(-20000, 20000);
             }
             if stand >= beta {
+                ts!(self, qs_standpat);
                 return stand;
             }
             alpha = alpha.max(stand);
             best = stand;
-            pos.gen_moves(&mut list, !extra_checks);
+            prof!(self, 1, pos.gen_moves(&mut list, !extra_checks));
         }
 
         let mut scores = [0i32; MAX_MOVES];
-        self.order_moves(pos, &list, &mut scores, tt_move, ply);
+        prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
 
         let mut legal = 0;
+        // 実験Q1・Q2：ここまでに選んだ（王手でない）駒取りの数、stand pat の値、直前の手の行き先
+        let mut q_picked = 0;
+        let stand_pat = best;
+        let recapture_sq = { let lm = pos.last_move(); if lm == MOVE_NONE { usize::MAX } else { mv_to(lm) } };
         for i in 0..list.len {
-            let m = Self::pick_move(&mut list, &mut scores, i);
+            let m = prof!(self, 13, Self::pick_move(&mut list, &mut scores, i));
             if !in_check {
                 let captured = pos.board[mv_to(m)] != 0;
                 let checking = (extra_checks
@@ -1313,21 +1660,44 @@ impl Searcher {
                 } else {
                     PIECE_VALUE[type_of(pos.board[mv_to(m)]) as usize] + if mv_is_promo(m) { 600 } else { 0 }
                 };
-                if !checking && self.feat & D_NO_QDELTA == 0 && best + gain + 200 < alpha {
+                if !checking && self.feat & D_NO_QDELTA == 0 && best + gain + tp(14) < alpha {
                     continue;
                 }
                 // 取り合いで損をする駒取りは読まない
                 if !checking && self.feat & D_NO_QSEE == 0 && self.exchange_score(pos, m) < 0 {
                     continue;
                 }
+                if !checking {
+                    q_picked += 1;
+                    // 実験Q1（cargo の機能 q_mc2）：やねうら王と同じく、王手でない駒取りは2手まで。
+                    // 評価＋155 が α に届かず、取り合いで得をしない手も読まない
+                    if cfg!(feature = "q_mc2")
+                        && (q_picked > 2 || (stand_pat + 155 <= alpha && self.exchange_score(pos, m) <= 0))
+                    {
+                        continue;
+                    }
+                    // 実験Q2（cargo の機能 q_recap）：静止探索の5手目より先は、直前に動いた駒を取り返す手だけ
+                    if cfg!(feature = "q_recap") && qdepth >= 5 && mv_to(m) != recapture_sq {
+                        continue;
+                    }
+                }
+            } else if cfg!(feature = "q_evsee") && best > -MATE_BOUND && self.exchange_score(pos, m) < 0 {
+                // 実験Q3（cargo の機能 q_evsee）：王手をかけられた局面でも、詰まない逃げ方が見つかった後は、取り合いで損をする逃げ方を読まない
+                continue;
             }
             self.set_pending(pos, m, ply);
-            if !pos.do_move_legal(m) {
+            let piece = if mv_is_drop(m) { make_piece(pos.side, mv_drop_pt(m)) } else { pos.board[mv_from(m)] };
+            if !prof!(self, 3, pos.do_move_legal(m)) {
                 continue;
             }
             legal += 1;
+            self.ss_pm[ply] = (piece, mv_to(m));
+            if in_check { ts!(self, qs_evasions); } else {
+                ts!(self, qs_moves);
+                if legal == 3 { ts!(self, qs_over2); }
+            }
             let s = -self.qsearch(pos, -beta, -alpha, ply + 1, qdepth + 1);
-            pos.undo_move();
+            prof!(self, 4, pos.undo_move());
             if self.stopped {
                 return 0;
             }
@@ -1355,7 +1725,7 @@ impl Searcher {
             } else {
                 BOUND_UPPER
             };
-            self.tt.store_qs(key, best_move, score_to_tt(best, ply), flag);
+            prof!(self, 10, self.tt.store_qs(key, best_move, score_to_tt(best, ply), flag));
         }
         best
     }

@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "2.7.0"
+version = "2.9.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
@@ -17,7 +17,8 @@ panic = "abort"
 [features]
 # 2.5 から既定で有効：連続王手の千日手（実験PC）・入玉宣言（CSA 27点法）・定跡（実験BK）・不安定なときの時間の延長（実験T1）。
 # 外すときは --no-default-features に、残すものを --features で付ける。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable"]
+# 10/23 から s_check（実験S1）も既定（手元の基準。公開はまだ）。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -44,3 +45,33 @@ nyugyoku = []
 corrhist = []
 # 実験T4：41手目以降で残り時間が加算の10手分より多いなら soft を 1.5 倍にする
 time_bank = []
+# 実験B4：20エポックで学習したネット（nets/b4.nn）を埋め込む
+net_b4 = []
+# 実験B5：水匠10 の教師データを加えて学習したネット（nets/b5.nn）を埋め込む
+net_b5 = []
+# 診断 diagSE：ExtEvalFile でやねうら王形式の NNUE（HalfKP 256x2-32-32）を読み、評価をまるごと置き換える。
+# NodesLimit（go に nodes を付けたのと同じ）と、デバッグ用の exteval コマンドも名乗る。探索と評価の差の切り分けだけに使う
+ext_eval = []
+# 実験S（探索、10/23）：S1 王手をかけられた局面の延長をやめ、損をしない王手の手を延長する／S2 浅い枝刈りを広げる（やねうら王の Step 13）／
+# S3 LMR を強める（PV でない局面・置換表の手が駒取り・ヒストリーで連続的に）
+s_check = []
+s_prune = []
+s_lmr = []
+# 実験S 第2回：S4 継続ヒストリー（1手前・2手前の手ごとの静かな手の実績）／S5 駒取りヒストリー
+s_conthist = []
+s_caphist = []
+# 実験S 第3回：S6 浅い枝刈りの軽い版（RFP を深さ6まで・PV でない局面で SEE の大きな損の手を省略）
+s_prune2 = []
+# 実験S 第4回：浅い局面で読む静かな手の数。S10 やねうら王と同じ (3+d²)/(2−improving)／S11 中間 (4+2d²)/(2−improving)
+s_lmp = []
+s_lmp_mid = []
+# 実験Q（静止探索、10/24〜）：Q1 王手でない駒取りは2手まで＋得をしない手の省略／Q2 5手目より先は取り返しだけ／Q3 王手をかけられた局面で損をする逃げ方を省略
+q_mc2 = []
+q_recap = []
+q_evsee = []
+# 実験SPSA（10/24〜）：探索の16個の値を USI の隠しオプション T_0〜T_15 で変えられるようにする（自動調整用）
+tune = []
+# 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
+prof = []
+# 診断：読みの木の形（局面数の内訳、カットの様子、読み直しの数）を数え、思考の終わりに info string tree で出す（主スレッドの分だけ）
+tree_stats = []

@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 2.7";
+const ENGINE_NAME: &str = "Sailfish 2.9";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
@@ -33,6 +33,8 @@ struct Engine {
     /// go ponder の局面が定跡にあったとき、ponderhit か stop で返す bestmove の行
     book_pending: Option<String>,
     rng: u64,
+    /// 診断 diagSE（cargo の機能 ext_eval）：0 でなければ、go に nodes を付けたのと同じにする
+    nodes_limit: u64,
 }
 
 impl Engine {
@@ -144,6 +146,26 @@ impl Engine {
                     self.threads = v.clamp(1, 64);
                 }
             }
+            #[cfg(feature = "ext_eval")]
+            "ExtEvalFile" => {
+                if let Err(e) = sailfish2::ext_eval::load_global(&value) {
+                    println!("info string ExtEvalFile を読み込めません: {}", e);
+                }
+            }
+            #[cfg(feature = "ext_eval")]
+            "NodesLimit" => {
+                if let Ok(v) = value.parse() {
+                    self.nodes_limit = v;
+                }
+            }
+            // 実験SPSA（cargo の機能 tune）：探索の値 T_0〜T_15（中身は search.rs の TUNE_DEFAULT）
+            n if cfg!(feature = "tune") && n.starts_with("T_") => {
+                if let (Ok(i), Ok(v)) = (n[2..].parse::<usize>(), value.parse::<i32>()) {
+                    if i < sailfish2::search::TUNE.len() {
+                        sailfish2::search::TUNE[i].store(v, Ordering::Relaxed);
+                    }
+                }
+            }
             "UseNeuralNet" => {
                 use sailfish2::search::{F_NN, FEAT};
                 if value.eq_ignore_ascii_case("true") {
@@ -214,6 +236,9 @@ impl Engine {
                 }
                 _ => {}
             }
+        }
+        if self.nodes_limit > 0 && limits.nodes == 0 && !limits.infinite {
+            limits.nodes = self.nodes_limit;
         }
 
         self.book_pending = None;
@@ -295,7 +320,30 @@ fn default_threads() -> usize {
     (logical / 2).clamp(1, 4)
 }
 
+/// この CPU で AVX2 向けのビルド（x86-64-v3）が動くか（将棋アリーナが、同梱の AVX2 版を使ってよいかを調べるのに使う）
+fn cpu_supports_v3() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::is_x86_feature_detected!("avx2")
+            && std::is_x86_feature_detected!("fma")
+            && std::is_x86_feature_detected!("bmi1")
+            && std::is_x86_feature_detected!("bmi2")
+            && std::is_x86_feature_detected!("lzcnt")
+            && std::is_x86_feature_detected!("movbe")
+            && std::is_x86_feature_detected!("f16c")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 fn main() {
+    // sailfish2 --cpu-avx2：AVX2 向けのビルドが動く CPU なら「avx2 yes」、そうでなければ「avx2 no」を出して終わる
+    if std::env::args().any(|a| a == "--cpu-avx2") {
+        println!("avx2 {}", if cpu_supports_v3() { "yes" } else { "no" });
+        return;
+    }
     now_us(); // 時計の基準を初期化
     // 2.4 から、評価関数は整数（int16）で計算するのが標準（実験C1）。USI の NNQuant=false で f32 に戻せる
     sailfish2::nn::set_quant_global(true);
@@ -319,6 +367,7 @@ fn main() {
         use_book: true,
         book_pending: None,
         rng: (now_us() ^ 0x9E37_79B9_7F4A_7C15) | 1,
+        nodes_limit: 0,
     };
 
     let stdin = io::stdin();
@@ -343,6 +392,10 @@ fn main() {
                 }
                 if cfg!(feature = "book") {
                     println!("option name UseBook type check default true");
+                }
+                if cfg!(feature = "ext_eval") {
+                    println!("option name ExtEvalFile type string default <empty>");
+                    println!("option name NodesLimit type spin default 0 min 0 max 1000000000");
                 }
                 println!("usiok");
             }
@@ -394,6 +447,12 @@ fn main() {
             // ---- デバッグ用コマンド ----
             "d" => print!("{}", engine.pos.display()),
             "eval" => println!("eval = {}", eval::evaluate(&engine.pos)),
+            // 診断 diagSE：外部の評価関数の静的評価（手番側から見た値。やねうら王の eval コマンドと比べる）
+            #[cfg(feature = "ext_eval")]
+            "exteval" => match sailfish2::ext_eval::global() {
+                Some(ext) => println!("exteval = {}", ext.evaluate(&engine.pos)),
+                None => println!("info string ExtEvalFile が読み込まれていない"),
+            },
             // 手番の偏りの確認: 今の局面の静的評価と、駒を取らず・成らず・王手でない手を指した後の静的評価（符号を反転）を比べる
             // 出力: evalgap hc <親> <子の最大> <子の中央値> nn <親> <子の最大> <子の中央値> moves <数>
             "evalgap" => {

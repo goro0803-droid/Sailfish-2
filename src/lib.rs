@@ -2,6 +2,8 @@
 
 pub mod book;
 pub mod eval;
+#[cfg(feature = "ext_eval")]
+pub mod ext_eval;
 pub mod nn;
 pub mod params;
 pub mod position;

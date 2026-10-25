@@ -34,15 +34,72 @@ const KING_RANK: [i32; 9] = [-80, -70, -60, -40, -20, -5, 5, 15, 10];
 /// 玉を攻めるときの持ち駒の重み（歩 香 桂 銀 角 飛 金）
 const HAND_ATTACK: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 4];
 
+/// 評価で使う表（実験 V9。前は毎回 NEIGHBOR をたどって求めていたもの。中身は同じ）
+struct EvalTables {
+    /// 2升の距離（筋・段の差の大きい方）
+    dist: [[u8; 81]; 81],
+    /// 1升動く駒の利く升 [手番][駒種][升]（個数と升）
+    step: Vec<(u8, [u8; 8])>,
+    /// 走る駒の升の並び [手番][升][方向]（個数と、近い順の升）
+    ray: Vec<(u8, [u8; 8])>,
+}
+
+fn tables() -> &'static EvalTables {
+    static T: std::sync::OnceLock<EvalTables> = std::sync::OnceLock::new();
+    T.get_or_init(|| {
+        let mut dist = [[0u8; 81]; 81];
+        for a in 0..81 {
+            for b in 0..81 {
+                dist[a][b] = (a / 9).abs_diff(b / 9).max((a % 9).abs_diff(b % 9)) as u8;
+            }
+        }
+        let mut step = vec![(0u8, [0u8; 8]); 2 * 15 * 81];
+        let mut ray = vec![(0u8, [0u8; 8]); 2 * 81 * 10];
+        for c in 0..2 {
+            for sq in 0..81 {
+                for pt in 0..15 {
+                    let e = &mut step[(c * 15 + pt) * 81 + sq];
+                    let mut mask = STEP_MASK[pt];
+                    while mask != 0 {
+                        let d = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        let to = NEIGHBOR[c][sq][d];
+                        if to >= 0 {
+                            e.1[e.0 as usize] = to as u8;
+                            e.0 += 1;
+                        }
+                    }
+                }
+                for d in 0..10 {
+                    let e = &mut ray[(c * 81 + sq) * 10 + d];
+                    let mut s = sq;
+                    loop {
+                        let to = NEIGHBOR[c][s][d];
+                        if to < 0 || e.0 == 8 {
+                            break;
+                        }
+                        e.1[e.0 as usize] = to as u8;
+                        e.0 += 1;
+                        if d >= 8 {
+                            break;
+                        }
+                        s = to as usize;
+                    }
+                }
+            }
+        }
+        EvalTables { dist, step, ray }
+    })
+}
+
 #[inline]
 fn dist(a: usize, b: usize) -> usize {
-    let df = (a / 9).abs_diff(b / 9);
-    let dr = (a % 9).abs_diff(b % 9);
-    df.max(dr)
+    tables().dist[a][b] as usize
 }
 
 /// 盤上の各升への利きの数（手番ごと）と、大駒の動ける升の数を数える
 fn attack_map(pos: &Position, att: &mut [[u8; 81]; 2], mobility: &mut [i32; 2]) {
+    let t = tables();
     for sq in 0..81 {
         let p = pos.board[sq];
         if p == 0 {
@@ -50,25 +107,16 @@ fn attack_map(pos: &Position, att: &mut [[u8; 81]; 2], mobility: &mut [i32; 2]) 
         }
         let c = color_of(p);
         let pt = type_of(p) as usize;
-        let mut mask = STEP_MASK[pt];
-        while mask != 0 {
-            let d = mask.trailing_zeros() as usize;
-            mask &= mask - 1;
-            let to = NEIGHBOR[c][sq][d];
-            if to >= 0 {
-                att[c][to as usize] += 1;
-            }
+        let (n, tos) = &t.step[(c * 15 + pt) * 81 + sq];
+        for &to in &tos[..*n as usize] {
+            att[c][to as usize] += 1;
         }
         let mut mask = SLIDE_MASK[pt];
         while mask != 0 {
             let d = mask.trailing_zeros() as usize;
             mask &= mask - 1;
-            let mut s = sq;
-            loop {
-                let to = NEIGHBOR[c][s][d];
-                if to < 0 {
-                    break;
-                }
+            let (n, tos) = &t.ray[(c * 81 + sq) * 10 + d];
+            for &to in &tos[..*n as usize] {
                 let to = to as usize;
                 att[c][to] += 1;
                 if pt != LANCE as usize {
@@ -77,7 +125,6 @@ fn attack_map(pos: &Position, att: &mut [[u8; 81]; 2], mobility: &mut [i32; 2]) 
                 if pos.board[to] != 0 {
                     break;
                 }
-                s = to;
             }
         }
     }
@@ -153,6 +200,7 @@ fn eval_impl<const PST_ON: bool>(pos: &Position) -> [i32; 2] {
     let mut att = [[0u8; 81]; 2];
     let mut mobility = [0i32; 2];
     attack_map(pos, &mut att, &mut mobility);
+    let dist = |a: usize, b: usize| tables().dist[a][b] as usize;
 
     for sq in 0..81 {
         let p = pos.board[sq];
@@ -162,8 +210,7 @@ fn eval_impl<const PST_ON: bool>(pos: &Position) -> [i32; 2] {
         let c = color_of(p);
         let pt = type_of(p);
         if PST_ON {
-            let i = pst_index(c, sq, pt);
-            score[c] += PST[i / 81][i % 81] as i32;
+            score[c] += PST[pt as usize][if c == BLACK { sq } else { 80 - sq }] as i32;
         }
         if pt == KING {
             score[c] += KING_RANK[rel_rank(c, sq % 9)];

@@ -401,27 +401,34 @@ unsafe fn forward_q_avx2(q: &QNet, acc: &Acc, stm: usize) -> f32 {
             _mm256_storeu_si256(x.as_mut_ptr().add(persp * H + i) as *mut __m256i, c);
         }
     }
-    let mut out = q.b3;
-    // 第2層の4行をまとめて計算し、入力の読み込みを共有する
+    // 第2層の8行をまとめて計算し、入力の読み込みを共有する。8行の和は hadd でまとめて1本にする（実験 V2。整数の和なので順番を変えても同じ値）
+    let mut sums = [0i32; L2];
     let mut j = 0;
     while j < L2 {
         let w = q.w2.as_ptr().add(j * 2 * H);
-        let mut s = [_mm256_setzero_si256(); 4];
+        let mut s = [_mm256_setzero_si256(); 8];
         for i in (0..2 * H).step_by(16) {
             let input = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
-            for k in 0..4 {
+            for k in 0..8 {
                 let wk = _mm256_loadu_si256(w.add(k * 2 * H + i) as *const __m256i);
                 s[k] = _mm256_add_epi32(s[k], _mm256_madd_epi16(input, wk));
             }
         }
-        for k in 0..4 {
-            let mut lanes = [0i32; 8];
-            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, s[k]);
-            let sum = lanes.iter().fold(0i32, |a, &b| a.wrapping_add(b));
-            let z = q.b2[j + k].wrapping_add(sum).clamp(0, q.s1 * q.s2);
-            out += q.w3[j + k] * z as f32;
-        }
-        j += 4;
+        let t0 = _mm256_hadd_epi32(s[0], s[1]);
+        let t1 = _mm256_hadd_epi32(s[2], s[3]);
+        let t2 = _mm256_hadd_epi32(s[4], s[5]);
+        let t3 = _mm256_hadd_epi32(s[6], s[7]);
+        let u0 = _mm256_hadd_epi32(t0, t1);
+        let u1 = _mm256_hadd_epi32(t2, t3);
+        let r = _mm256_add_epi32(_mm256_permute2x128_si256(u0, u1, 0x20), _mm256_permute2x128_si256(u0, u1, 0x31));
+        _mm256_storeu_si256(sums.as_mut_ptr().add(j) as *mut __m256i, r);
+        j += 8;
+    }
+    // 出力層は小数なので、これまでと同じ順番（j の小さい順）で足す
+    let mut out = q.b3;
+    for j in 0..L2 {
+        let z = q.b2[j].wrapping_add(sums[j]).clamp(0, q.s1 * q.s2);
+        out += q.w3[j] * z as f32;
     }
     out
 }
@@ -820,8 +827,14 @@ fn set_global(net: Network) {
     }
 }
 
-/// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn）
+/// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn）。
+/// cargo の機能 net_b4 なら実験B4（20エポック）の、net_b5 なら実験B5（水匠10 のデータを追加）のネットを埋め込む。
+#[cfg(not(any(feature = "net_b4", feature = "net_b5")))]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/default.nn");
+#[cfg(feature = "net_b4")]
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/b4.nn");
+#[cfg(all(feature = "net_b5", not(feature = "net_b4")))]
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/b5.nn");
 
 /// 埋め込んだ標準のネットワークを読み込んで、エンジン全体で使うようにする
 pub fn load_default() -> Result<(), String> {
