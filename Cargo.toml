@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "2.9.0"
+version = "3.0.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
@@ -71,6 +71,12 @@ q_recap = []
 q_evsee = []
 # 実験SPSA（10/24〜）：探索の16個の値を USI の隠しオプション T_0〜T_15 で変えられるようにする（自動調整用）
 tune = []
+# 実験M（10/27〜、floodgate の逆転負けの対策）：M1 静止探索の入口で1手詰めを確かめる／M2 王手をかけられて逃げ方が2通り以下なら1手延長
+m_mate1 = []
+m_evext = []
+# 実験S12（10/28、診断 diagEP 第4・5歩から）：singular に multi-cut・負の延長・2手延長を足す（やねうら王の考え方）
+s_sing2 = []
+node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []
 # 診断：読みの木の形（局面数の内訳、カットの様子、読み直しの数）を数え、思考の終わりに info string tree で出す（主スレッドの分だけ）

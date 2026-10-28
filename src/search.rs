@@ -10,8 +10,31 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+/// 診断 diagEP（cargo の機能 node_dump、既定で無効）：通常の探索の局面を一定の間隔で書き出す。
+/// 書き出す先は環境変数 SAILFISH_DUMP_FILE、間隔は SAILFISH_DUMP_EVERY（既定 1000 局面に1つ）
+#[cfg(feature = "node_dump")]
+mod node_dump {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    static OUT: OnceLock<Option<(Mutex<File>, u64)>> = OnceLock::new();
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    pub fn write(line: impl FnOnce() -> String) {
+        let Some((f, every)) = OUT.get_or_init(|| {
+            let path = std::env::var("SAILFISH_DUMP_FILE").ok()?;
+            let every = std::env::var("SAILFISH_DUMP_EVERY").ok().and_then(|s| s.parse().ok()).unwrap_or(1000u64);
+            Some((Mutex::new(File::create(path).ok()?), every.max(1)))
+        }) else { return };
+        if CTR.fetch_add(1, Ordering::Relaxed) % *every == 0 {
+            let _ = writeln!(f.lock().unwrap(), "{}", line());
+        }
+    }
+}
+
 /// 探索の改良を個別に入れ替えるためのビット（USI の隠しオプション Feat で指定。強さの比較用）
-pub static FEAT: AtomicU32 = AtomicU32::new(F_QS_TT | F_NN | F_ECACHE | F_DELTA_HAND);
+/// 実験S12（10/28）で singular の +1 の延長を既定で有効にした（AobaNNUE 相手 800局で +7.8ポイント）
+pub static FEAT: AtomicU32 = AtomicU32::new(F_QS_TT | F_NN | F_ECACHE | F_DELTA_HAND | F_SINGULAR);
 /// 静止探索でも置換表を使う
 pub const F_QS_TT: u32 = 1;
 /// 置換表に手がないとき、深さを 1 減らす（Internal Iterative Reduction）
@@ -258,6 +281,8 @@ pub struct Searcher {
     root_goal_moves: Vec<Move>,
     iteration_depth: i32,
     singular_verifying: bool,
+    /// 実験S12（cargo の機能 s_sing2）：根からその ply までに2手延長した回数
+    dext: [i32; MAX_PLY + 2],
     /// 省略の診断（cargo の機能 prune_diag）：確かめるための探索の最中か、省略しない ply、間引きの数
     diag_verifying: bool,
     diag_noprune_ply: usize,
@@ -381,6 +406,11 @@ struct TreeStats {
     d_all: [u64; 24],
     d_all_moves: [u64; 24],
     d_all_pruned: [u64; 24],
+    /// どの手も α を超えなかった局面で実際に読んだ手の合計、β カットした局面の数・1手目でカットした数・カットまでに試した手（省いた手も含む）の合計
+    d_all_searched: [u64; 24],
+    d_cut: [u64; 24],
+    d_cut_first: [u64; 24],
+    d_cut_moves: [u64; 24],
 }
 
 /// tree_stats のときだけ、残りの深さ d の欄に数を足す
@@ -539,6 +569,7 @@ impl Searcher {
             root_goal_moves: Vec::new(),
             iteration_depth: 0,
             singular_verifying: false,
+            dext: [0; MAX_PLY + 2],
             diag_verifying: false,
             diag_noprune_ply: usize::MAX,
             diag_ctr: 0,
@@ -779,9 +810,9 @@ impl Searcher {
                 t.cut, t.cut_first, t.cut_moves, t.all_nodes, t.moves, t.ext_check, t.lmr, t.lmr_re, t.pvs_re,
                 t.qs_standpat, t.qs_deep, t.qs_moves, t.qs_evasions, t.qs_over2);
             let j = |a: &[u64; 24]| a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
-            println!("info string treed main {} tt_cut {} rfp {} null_cut {} moves {} lmr {} red {} ext {} all {} all_moves {} all_pruned {}",
+            println!("info string treed main {} tt_cut {} rfp {} null_cut {} moves {} lmr {} red {} ext {} all {} all_moves {} all_pruned {} all_searched {} cut {} cut_first {} cut_moves {}",
                 j(&t.d_main), j(&t.d_tt_cut), j(&t.d_rfp), j(&t.d_null_cut), j(&t.d_moves), j(&t.d_lmr), j(&t.d_red), j(&t.d_ext),
-                j(&t.d_all), j(&t.d_all_moves), j(&t.d_all_pruned));
+                j(&t.d_all), j(&t.d_all_moves), j(&t.d_all_pruned), j(&t.d_all_searched), j(&t.d_cut), j(&t.d_cut_first), j(&t.d_cut_moves));
         }
         if cfg!(feature = "corrhist") {
             let (raw, cor, n) = std::mem::take(&mut self.corr_stats);
@@ -1147,6 +1178,10 @@ impl Searcher {
             static_eval = (static_eval + self.corr[idx] / 16).clamp(-20000, 20000);
         }
         self.static_evals[ply] = static_eval;
+        #[cfg(feature = "node_dump")]
+        if !in_check && excluded == MOVE_NONE && ply > 0 {
+            node_dump::write(|| format!("{} 1\t{}\t{}\t{}", crate::psv::sfen_key(pos, false), depth, ply, static_eval));
+        }
         // 2 手前（自分の手番）より評価値が良くなっているか（わからないときは良くなっている扱い）
         let imp_on = self.feat & F_IMPROVING != 0;
         let improving = ply < 2 || self.static_evals[ply - 2] == -INF || static_eval > self.static_evals[ply - 2];
@@ -1202,6 +1237,7 @@ impl Searcher {
                 self.set_pending_null(ply);
                 self.ss_pm[ply] = (0, 0);
                 ts!(self, null_try);
+                if cfg!(feature = "s_sing2") { self.dext[ply + 1] = self.dext[ply]; }
                 pos.do_null();
                 let s = -self.negamax(pos, -beta, -beta + 1, depth - 1 - r, ply + 1, false);
                 pos.undo_null();
@@ -1220,6 +1256,8 @@ impl Searcher {
         // Verification has half depth and excludes the TT move explicitly.
         // Nested singular verification is disabled throughout that subtree.
         let mut singular_move = MOVE_NONE;
+        // 実験S12（s_sing2）：置換表の手の延長量（+1・+2・−2）
+        let mut sing_ext = 0;
         if self.feat & F_SINGULAR != 0 && excluded == MOVE_NONE
             && !self.singular_verifying && !in_check && ply > 0 && depth >= 7
             && ply < (2 * self.iteration_depth) as usize
@@ -1249,6 +1287,20 @@ impl Searcher {
                         if alternative < threshold {
                             singular_move = tt_move;
                             self.singular_extensions += 1;
+                            sing_ext = 1;
+                            // 実験S12：ほかの手がはっきり悪ければ2手延長（PV でない局面、根からの2手延長は6回まで）
+                            if cfg!(feature = "s_sing2") && !pv_node && alternative < threshold - 75 && self.dext[ply] <= 6 {
+                                sing_ext = 2;
+                            }
+                        } else if cfg!(feature = "s_sing2") {
+                            if threshold >= beta {
+                                // 実験S12 multi-cut：置換表の手を除いても β を超える手があるので、この局面は β カットとみなす
+                                return threshold;
+                            } else if tt_score >= beta {
+                                // 実験S12 負の延長：置換表の手だけが β を超えそうとは言えないので、置換表の手を2手浅く読む
+                                singular_move = tt_move;
+                                sing_ext = -2;
+                            }
                         }
                     }
                 }
@@ -1262,6 +1314,23 @@ impl Searcher {
 
         let mut list = MoveList::new();
         prof!(self, 0, pos.gen_moves(&mut list, false));
+        // 実験M2（cargo の機能 m_evext）：王手をかけられていて、逃げ方が2通り以下なら1手延長する（追い詰められた筋を深く読む）。
+        // S1 で王手をかけられた局面の延長をやめたので、その副作用（自玉への詰めろの読み落とし）を減らすため
+        if cfg!(feature = "m_evext") && in_check && excluded == MOVE_NONE && ply > 0
+            && ply < (2 * self.iteration_depth) as usize
+        {
+            let mut n = 0;
+            for i in 0..list.len {
+                if pos.do_move_legal(list.moves[i]) {
+                    pos.undo_move();
+                    n += 1;
+                    if n > 2 { break; }
+                }
+            }
+            if n <= 2 {
+                depth += 1;
+            }
+        }
         let mut scores = [0i32; MAX_MOVES];
         prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
 
@@ -1281,6 +1350,8 @@ impl Searcher {
         let mut n_caps = 0;
         // 実験S2：指す前に省略した手の数（やねうら王の moveCount と同じく、省略した手も数える）
         let mut pruned = 0;
+        // tree_stats：実際に読んだ手の数（LMP・futility で省いた手を除く）
+        let mut ts_searched = 0;
         // 実験S3：置換表の手が駒を取る手か
         let tt_capture = tt_move != MOVE_NONE && !mv_is_drop(tt_move) && pos.board[mv_to(tt_move)] != 0;
 
@@ -1403,10 +1474,19 @@ impl Searcher {
                 n_caps += 1;
             }
 
-            let new_depth = depth - 1 + i32::from(m == singular_move || check_ext);
+            // 実験S12（s_sing2）：置換表の手は singular の結果（+1・+2・−2）だけで延長量を決める（王手の延長と重ねない）
+            let new_depth = if cfg!(feature = "s_sing2") && m == singular_move {
+                depth - 1 + sing_ext
+            } else {
+                depth - 1 + i32::from(m == singular_move || check_ext)
+            };
+            if cfg!(feature = "s_sing2") {
+                self.dext[ply + 1] = self.dext[ply] + i32::from(m == singular_move && sing_ext == 2);
+            }
             if check_ext { ts!(self, ext_check); }
             ts!(self, moves);
             tsd!(self, d_moves, d0);
+            if cfg!(feature = "tree_stats") { ts_searched += 1; }
             if new_depth >= d0 { tsd!(self, d_ext, d0); }
             let mut s;
             if legal == 1 {
@@ -1468,6 +1548,9 @@ impl Searcher {
                         ts!(self, cut);
                         ts!(self, cut_moves, legal);
                         if legal == 1 { ts!(self, cut_first); }
+                        tsd!(self, d_cut, d0);
+                        tsd!(self, d_cut_moves, d0, legal + pruned);
+                        if ts_searched == 1 { tsd!(self, d_cut_first, d0); }
                         // 実験S5：カットした駒取りを上げ、先に試して失敗した駒取りを下げる
                         if cfg!(feature = "s_caphist") && excluded == MOVE_NONE {
                             let bonus = (depth * depth).min(tp(15));
@@ -1528,6 +1611,7 @@ impl Searcher {
             tsd!(self, d_all, d0);
             tsd!(self, d_all_moves, d0, legal);
             tsd!(self, d_all_pruned, d0, list.len as i32 - legal);
+            tsd!(self, d_all_searched, d0, ts_searched);
         }
         // 評価補正履歴を覚える（向きの合わない限界値、駒を取る手が最善、詰みの値は使わない）
         if cfg!(feature = "corrhist") && excluded == MOVE_NONE && !in_check
@@ -1587,8 +1671,10 @@ impl Searcher {
         let mate_probe = qdepth == 0 && pv_node && self.feat & F_QMATE1 != 0;
         let use_tt = self.feat & F_QS_TT != 0 && !extra_checks && !mate_probe;
         let mut tt_move = MOVE_NONE;
+        let mut tt_hit = false;
         if use_tt {
             if let Some(e) = prof!(self, 9, self.tt.probe(key)) {
+                tt_hit = true;
                 tt_move = e.mv;
                 if !pv_node {
                     let s = score_from_tt(e.score as i32, ply);
@@ -1604,7 +1690,10 @@ impl Searcher {
 
         self.ensure_acc(pos, ply);
         let in_check = pos.in_check();
-        if mate_probe {
+        // 実験M1（cargo の機能 m_mate1）：静止探索の入口（駒取りしか読まないので、駒を取らない詰みを見落とす）で、
+        // 王手をかけられておらず置換表に無い局面は、1手詰めを確かめる（やねうら王の qsearch の mate_1ply と同じ考え方）
+        let mate1 = cfg!(feature = "m_mate1") && qdepth == 0 && !in_check && !tt_hit;
+        if mate_probe || mate1 {
             if let Some(m) = pos.mate_in_one() {
                 self.pv[ply * PV_STRIDE] = m;
                 self.pv_len[ply] = 1;
