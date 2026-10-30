@@ -305,6 +305,102 @@ impl Position {
         result
     }
 
+    /// 実験V11：駒を取らない手が自玉を王手にさらさないかを、盤を一時的に書き換えて調べる（`do_move_legal` と同じ判定）。
+    /// 王手をかけられていない局面の、王手にならない手だけに使う（打ち歩詰めは王手の手なので、ここでは起きない）
+    pub fn is_legal_quiet(&mut self, m: Move) -> bool {
+        if mv_is_drop(m) { return true; }
+        let us = self.side;
+        let from = mv_from(m);
+        let to = mv_to(m);
+        let pc = self.board[from];
+        let moving = if mv_is_promo(m) { pc + PROMOTE } else { pc };
+        self.board[from] = 0;
+        self.board[to] = moving;
+        let k = if from == self.king[us] { to } else { self.king[us] };
+        let ok = k == NO_SQ || !self.attacked(k, us ^ 1);
+        self.board[to] = 0;
+        self.board[from] = pc;
+        ok
+    }
+
+    /// 実験V10：手 m が `gen_moves` の作る疑似合法手に含まれるかを、手を作らずに調べる（置換表の手の確かめ用）
+    pub fn is_pseudo_legal(&self, m: Move) -> bool {
+        if m == MOVE_NONE || m >> 15 != 0 {
+            return false;
+        }
+        let us = self.side;
+        let to = mv_to(m);
+        if to >= 81 || (self.board[to] != 0 && color_of(self.board[to]) == us) {
+            return false;
+        }
+        if mv_is_drop(m) {
+            let pt = mv_drop_pt(m);
+            if mv_is_promo(m) || !(PAWN..=GOLD).contains(&pt) || self.hand[us][pt as usize] == 0 || self.board[to] != 0 {
+                return false;
+            }
+            let rr = rel_rank(us, to % 9);
+            return match pt {
+                PAWN => {
+                    let own_pawn = make_piece(us, PAWN);
+                    rr != 0 && !(0..9).any(|r| self.board[(to / 9) * 9 + r] == own_pawn)
+                }
+                LANCE => rr != 0,
+                KNIGHT => rr > 1,
+                _ => true,
+            };
+        }
+        let from = mv_from(m);
+        let p = self.board[from];
+        if p == 0 || color_of(p) != us {
+            return false;
+        }
+        let pt = type_of(p);
+        let mut reach = false;
+        let mut mask = STEP_MASK[pt as usize];
+        while mask != 0 && !reach {
+            let d = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            reach = NEIGHBOR[us][from][d] == to as i8;
+        }
+        let mut mask = SLIDE_MASK[pt as usize];
+        while mask != 0 && !reach {
+            let d = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let mut sq = from;
+            loop {
+                let n = NEIGHBOR[us][sq][d];
+                if n < 0 {
+                    break;
+                }
+                if n == to as i8 {
+                    reach = true;
+                    break;
+                }
+                if self.board[n as usize] != 0 {
+                    break;
+                }
+                sq = n as usize;
+            }
+        }
+        if !reach {
+            return false;
+        }
+        // 成り・不成は push_moves と同じ決まり
+        let zone = can_promote(pt) && (rel_rank(us, from % 9) <= 2 || rel_rank(us, to % 9) <= 2);
+        if mv_is_promo(m) {
+            return zone;
+        }
+        if zone {
+            let rr = rel_rank(us, to % 9);
+            return match pt {
+                PAWN | LANCE => rr != 0,
+                KNIGHT => rr > 1,
+                _ => true,
+            };
+        }
+        true
+    }
+
     /// Exact one-ply checkmate, including quiet checks and legal drops.
     /// The input position is restored on every path; pawn-drop mate is rejected.
     pub fn mate_in_one(&mut self) -> Option<Move> {
@@ -797,6 +893,44 @@ mod tests {
             }
         }
         assert!(captures > 20 && drops > 20 && promotions > 10 && checks > 10);
+    }
+
+    #[test]
+    fn pseudo_legal_check_matches_generated_moves() {
+        let mut pos = Position::startpos();
+        let mut rng = 192837465u64;
+        for _ in 0..800 {
+            let mut list = MoveList::new();
+            pos.gen_moves(&mut list, false);
+            let gen = &list.moves[..list.len];
+            // 盤上の手はすべての移動元・移動先・成りの組み合わせ、駒打ちはすべての駒種・升（駒種 0 と玉も含む）
+            for from in 0..81 {
+                for to in 0..81 {
+                    for promo in [false, true] {
+                        let m = make_move(from, to, promo);
+                        if m == MOVE_NONE { continue; }
+                        assert_eq!(pos.is_pseudo_legal(m), gen.contains(&m), "{}", move_to_usi(m));
+                    }
+                }
+            }
+            for pt in 0..=KING {
+                for to in 0..81 {
+                    let m = make_drop(pt, to);
+                    assert_eq!(pos.is_pseudo_legal(m), gen.contains(&m));
+                    assert!(!pos.is_pseudo_legal(m | 1 << 14));
+                }
+            }
+            assert!(!pos.is_pseudo_legal(MOVE_NONE));
+            let legal = pos.legal_moves();
+            if legal.is_empty() {
+                pos = Position::startpos();
+            } else {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                pos.do_move(legal[(rng % legal.len() as u64) as usize]);
+            }
+        }
     }
 }
 

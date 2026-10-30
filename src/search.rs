@@ -1313,7 +1313,16 @@ impl Searcher {
         }
 
         let mut list = MoveList::new();
-        prof!(self, 0, pos.gen_moves(&mut list, false));
+        let mut scores = [0i32; MAX_MOVES];
+        // 実験V10（cargo の機能 v_ttfirst）：置換表の手を、手を作る前に試す。β カットすれば手の生成・点数づけを省く。
+        // カットしなければ、手を作って残りを今と同じ並べ方で試す（置換表の手は飛ばす）。根の局面と M2 では使わない
+        let tt_first = cfg!(feature = "v_ttfirst") && !cfg!(feature = "m_evext") && ply > 0
+            && tt_move != MOVE_NONE && pos.is_pseudo_legal(tt_move);
+        let mut tt_pending = tt_first;
+        let mut generated = !tt_first;
+        if generated {
+            prof!(self, 0, pos.gen_moves(&mut list, false));
+        }
         // 実験M2（cargo の機能 m_evext）：王手をかけられていて、逃げ方が2通り以下なら1手延長する（追い詰められた筋を深く読む）。
         // S1 で王手をかけられた局面の延長をやめたので、その副作用（自玉への詰めろの読み落とし）を減らすため
         if cfg!(feature = "m_evext") && in_check && excluded == MOVE_NONE && ply > 0
@@ -1331,8 +1340,9 @@ impl Searcher {
                 depth += 1;
             }
         }
-        let mut scores = [0i32; MAX_MOVES];
-        prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
+        if generated {
+            prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
+        }
 
         let us = pos.side;
         let guard_on = self.feat & F_TACTICAL_GUARD != 0 && excluded == MOVE_NONE
@@ -1354,9 +1364,41 @@ impl Searcher {
         let mut ts_searched = 0;
         // 実験S3：置換表の手が駒を取る手か
         let tt_capture = tt_move != MOVE_NONE && !mv_is_drop(tt_move) && pos.board[mv_to(tt_move)] != 0;
+        // Late move pruning の判定（n はこの手を含めた合法手の数）。実験V11 で、指す前と指した後の両方から使う
+        let lmp_hit = |n: i32| -> bool {
+            if cfg!(feature = "s_lmp") {
+                // 実験S10（cargo の機能 s_lmp）：やねうら王と同じ (3+d²)/(2−improving) 手目から省略（深さの上限なし）
+                n >= (3 + depth * depth) / (2 - i32::from(improving))
+            } else if cfg!(feature = "s_lmp_mid") {
+                // 実験S11（s_lmp_mid）：今の 4+3d² とやねうら王の中間 (4+2d²)/(2−improving)
+                n >= (4 + 2 * depth * depth) / (2 - i32::from(improving))
+            } else {
+                let lmp_base = tp(5) + depth * depth * tp(6);
+                let lmp_limit = if imp_on && !improving { lmp_base * 2 / 3 } else { lmp_base };
+                depth <= tp(7) && n > lmp_limit
+            }
+        };
+        // 実験V11（cargo の機能 v_prelmp）：LMP・futility を指す前に判定できる局面か（戦術の守りと診断が無効のとき）
+        let pre_lmp = cfg!(feature = "v_prelmp") && !cfg!(feature = "s_prune") && !cfg!(feature = "prune_diag")
+            && !guard_on && excluded == MOVE_NONE && !pv_node && !in_check;
 
-        for i in 0..list.len {
-            let m = prof!(self, 13, Self::pick_move(&mut list, &mut scores, i));
+        let mut next = 0;
+        loop {
+            let m = if tt_pending {
+                tt_pending = false;
+                tt_move
+            } else {
+                if !generated {
+                    generated = true;
+                    prof!(self, 0, pos.gen_moves(&mut list, false));
+                    prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
+                }
+                if next >= list.len { break; }
+                let m = prof!(self, 13, Self::pick_move(&mut list, &mut scores, next));
+                next += 1;
+                if tt_first && m == tt_move { continue; }
+                m
+            };
             if m == excluded { continue; }
             let to = mv_to(m);
             let is_cap = !mv_is_drop(m) && pos.board[to] != 0;
@@ -1407,6 +1449,21 @@ impl Searcher {
                     continue;
                 }
             }
+            // 実験V11（cargo の機能 v_prelmp）：指した後と同じ条件の LMP・futility を、指す前に判定する。
+            // この手を含めた合法手の数は legal + 1、王手かどうかは指す前に調べる。省く手が合法なら、今と同じく数に入れる
+            if pre_lmp && quiet && best > -MATE_BOUND {
+                let n = legal + 1;
+                let lmp = self.feat & D_NO_LMP == 0 && lmp_hit(n);
+                let fut = !lmp && self.feat & D_NO_FUTILITY == 0 && depth <= tp(4) && n > 1
+                    && static_eval + tp(2) + tp(3) * depth <= alpha;
+                if (lmp || fut) && !(if cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee") { pre_check } else { prof!(self, 5, pos.gives_check(m)) }) {
+                    if pos.is_legal_quiet(m) {
+                        legal += 1;
+                        if lmp { ts!(self, lmp); } else { ts!(self, fut); }
+                    }
+                    continue;
+                }
+            }
             let escape = guard_on && quiet && !mv_is_drop(m)
                 && threats.hanging_from(pos, mv_from(m));
             let safe_reply = guard_on && quiet && (escape || threats.majors != 0)
@@ -1450,18 +1507,7 @@ impl Searcher {
                     }
                 }
                 // Late move pruning（浅い深さでの後半の静かな手を省略）
-                let lmp_base = tp(5) + depth * depth * tp(6);
-                let lmp_limit = if imp_on && !improving { lmp_base * 2 / 3 } else { lmp_base };
-                // 実験S10（cargo の機能 s_lmp）：やねうら王と同じ (3+d²)/(2−improving) 手目から省略（深さの上限なし）。
-                // 実験S11（s_lmp_mid）：今の 4+3d² とやねうら王の中間 (4+2d²)/(2−improving)
-                let lmp = if cfg!(feature = "s_lmp") {
-                    legal >= (3 + depth * depth) / (2 - i32::from(improving))
-                } else if cfg!(feature = "s_lmp_mid") {
-                    legal >= (4 + 2 * depth * depth) / (2 - i32::from(improving))
-                } else {
-                    depth <= tp(7) && legal > lmp_limit
-                };
-                if self.feat & D_NO_LMP == 0 && lmp {
+                if self.feat & D_NO_LMP == 0 && lmp_hit(legal) {
                     ts!(self, lmp);
                     prof!(self, 15, pos.undo_move());
                     continue;
