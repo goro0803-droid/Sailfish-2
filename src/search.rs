@@ -1368,7 +1368,15 @@ impl Searcher {
                 continue;
             }
             // 指す前の王手の判定は、実験S2・S6 のときだけ（S1 の延長は、指した後に王手かどうかで決める。実験 V6）
-            let pre_check = (cfg!(feature = "s_prune") || cfg!(feature = "s_prune2")) && prof!(self, 5, pos.gives_check(m));
+            let pre_check = (cfg!(feature = "s_prune") || cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee"))
+                && prof!(self, 5, pos.gives_check(m));
+            // 実験S13（cargo の機能 s_capsee）：S2 のうち、取り合いで大きく損をする駒取り・成り・王手を指す前に省く部分だけ
+            if cfg!(feature = "s_capsee") && ply > 0 && excluded == MOVE_NONE && !in_check && best > -MATE_BOUND
+                && (is_cap || is_promo || pre_check) && self.exchange_score(pos, m) < -218 * depth
+            {
+                pruned += 1;
+                continue;
+            }
             // 実験S2（cargo の機能 s_prune）：指す前の省略（やねうら王の Step 13 と同じ考え方）
             if cfg!(feature = "s_prune") && ply > 0 && excluded == MOVE_NONE && !in_check && best > -MATE_BOUND {
                 let mc = legal + pruned + 1;

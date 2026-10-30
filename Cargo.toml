@@ -18,7 +18,8 @@ panic = "abort"
 # 2.5 から既定で有効：連続王手の千日手（実験PC）・入玉宣言（CSA 27点法）・定跡（実験BK）・不安定なときの時間の延長（実験T1）。
 # 外すときは --no-default-features に、残すものを --features で付ける。
 # 10/23 から s_check（実験S1）も既定（手元の基準。公開はまだ）。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check"]
+# 10/30 から s_prune2（実験S6 の軽い枝刈り）も既定（実験S13：singular の入った 3.0 の上で、AobaNNUE 相手 1,200局で +4.1ポイント）。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -76,6 +77,8 @@ m_mate1 = []
 m_evext = []
 # 実験S12（10/28、診断 diagEP 第4・5歩から）：singular に multi-cut・負の延長・2手延長を足す（やねうら王の考え方）
 s_sing2 = []
+# 実験S13（10/28）：singular の入った 3.0 の上で枝刈りを測り直す。S2 のうち駒取り・成り・王手の SEE による省略だけ
+s_capsee = []
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []
