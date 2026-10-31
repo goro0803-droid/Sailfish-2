@@ -271,6 +271,10 @@ pub struct Searcher {
     ecache: Vec<(u64, i32)>,
     /// キャッシュした土台評価に対応する USI 評価オプション。
     ecache_params: (i32, i32),
+    /// 実験 速さ3 V12（cargo の機能 v_fcache）：ecache に最終の評価値を入れているときの、そのネットの目印（0 なら土台評価）
+    ecache_net: usize,
+    /// 実験 速さ3 H1（cargo の機能 h_keep）：補助スレッドの探索状態を、手をまたいで持ち越す
+    helpers: Vec<Searcher>,
     /// ニューラルネットワーク（F_NN が有効で、読み込み済みのとき）
     nn: Option<Arc<Network>>,
     /// 各 ply の局面に対応するアキュムレータ（nn があるときだけ使う）
@@ -541,6 +545,9 @@ impl Searcher {
     /// 新しい対局：評価補正履歴の表を消す
     pub fn new_game(&mut self) {
         self.corr.iter_mut().for_each(|e| *e = 0);
+        for h in &mut self.helpers {
+            h.new_game();
+        }
     }
 
     pub fn new(hash_mb: usize, shared: Arc<Shared>) -> Searcher {
@@ -562,6 +569,8 @@ impl Searcher {
                 crate::eval::KING_DANGER_PCT.load(Ordering::Relaxed),
                 crate::eval::MOBILITY_WEIGHT.load(Ordering::Relaxed),
             ),
+            ecache_net: 0,
+            helpers: Vec::new(),
             nn: None,
             accs: Vec::new(),
             pend: Vec::new(),
@@ -621,6 +630,18 @@ impl Searcher {
             return ext.evaluate(pos);
         }
         if self.feat & F_ECACHE != 0 && self.nn.as_ref().is_some_and(|net| net.base_hc) {
+            // 実験 速さ3 V12（cargo の機能 v_fcache）：整数化したネットは同じ局面なら同じ値になるので、最終の値を覚える
+            if self.ecache_net != 0 {
+                let i = pos.key as usize & ((1 << ECACHE_BITS) - 1);
+                let e = self.ecache[i];
+                if e.0 == pos.key && e.1 != i32::MIN {
+                    return e.1;
+                }
+                let base = prof!(self, 16, evaluate(pos));
+                let v = self.nn.as_ref().unwrap().forward_with_base(&self.accs[ply], pos.side, base);
+                self.ecache[i] = (pos.key, v);
+                return v;
+            }
             let base = self.cached_base_eval(pos);
             return self.nn.as_ref().unwrap().forward_with_base(&self.accs[ply], pos.side, base);
         }
@@ -674,6 +695,15 @@ impl Searcher {
         if nn.is_some() && self.accs.len() != MAX_PLY + 2 {
             self.accs = vec![Acc::default(); MAX_PLY + 2];
             self.pend = vec![(MOVE_NONE, 0); MAX_PLY + 2];
+        }
+        // 実験 速さ3 V12：ecache に入れる値の種類（土台評価か、このネットの最終の値か）が変わったら消す
+        let net_id = match &nn {
+            Some(n) if cfg!(feature = "v_fcache") && n.q.is_some() && n.base_hc => Arc::as_ptr(n) as usize,
+            _ => 0,
+        };
+        if net_id != self.ecache_net {
+            self.ecache.fill((0, i32::MIN));
+            self.ecache_net = net_id;
         }
         self.nn = nn;
     }
@@ -777,9 +807,36 @@ impl Searcher {
 
         // 指せる手が 1 つなら補助スレッドは要らない
         let n_helpers = if root_moves.len() > 1 { self.threads.saturating_sub(1) } else { 0 };
+        // 実験 速さ3 H1（cargo の機能 h_keep）：補助スレッドの探索状態（ヒストリー・counter・評価のキャッシュ）を作り直さず、
+        // 主スレッドと同じく手をまたいで持ち越す（置換表が変わったときだけ作り直す）
+        let mut kept = std::mem::take(&mut self.helpers);
+        if cfg!(feature = "h_keep") {
+            if kept.first().is_some_and(|h| !Arc::ptr_eq(&h.tt, &self.tt)) {
+                kept.clear();
+            }
+            while kept.len() < n_helpers {
+                let h = self.make_helper(kept.len() + 1);
+                kept.push(h);
+            }
+            for h in kept.iter_mut().take(n_helpers) {
+                h.limits = self.limits;
+                h.feat = self.feat;
+                h.root_goal_moves = self.root_goal_moves.clone();
+                h.sync_eval_cache();
+                h.set_network(self.nn.clone());
+                h.history.iter_mut().for_each(|v| *v /= 4);
+                h.cont.iter_mut().for_each(|v| *v /= 2);
+                h.caph.iter_mut().for_each(|v| *v /= 2);
+            }
+        }
+        let mut fresh: Vec<Searcher> = if cfg!(feature = "h_keep") {
+            Vec::new()
+        } else {
+            (1..=n_helpers).map(|idx| self.make_helper(idx)).collect()
+        };
+        let pool: &mut [Searcher] = if cfg!(feature = "h_keep") { &mut kept[..n_helpers] } else { &mut fresh[..] };
         let (best, ponder) = std::thread::scope(|s| {
-            for idx in 1..=n_helpers {
-                let mut helper = self.make_helper(idx);
+            for helper in pool.iter_mut() {
                 let mut hp = pos.clone();
                 let roots = root_moves.clone();
                 std::thread::Builder::new()
@@ -793,6 +850,7 @@ impl Searcher {
             self.shared.helpers_stop.store(true, Ordering::Relaxed);
             r
         });
+        self.helpers = kept;
 
         self.wait_for_stop();
         if cfg!(feature = "prune_diag") {
@@ -1933,6 +1991,35 @@ impl Searcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_quantized_final_matches_uncached_evaluation() {
+        // 実験 速さ3 V12：整数化したネットでは、最終の値を覚えても計算し直した値と同じになる
+        let mut net = Network::random(72);
+        net.base_hc = true;
+        net.set_quant(true);
+        let net = Arc::new(net);
+        let mut searcher = Searcher::new(1, Arc::new(Shared::new()));
+        searcher.set_network(Some(net.clone()));
+        searcher.feat = F_NN | F_ECACHE;
+        let mut pos = Position::startpos();
+        let mut rng = 192837465u64;
+        for _ in 0..1000 {
+            net.refresh(&pos, &mut searcher.accs[0]);
+            let expected = net.forward(&searcher.accs[0], &pos);
+            assert_eq!(searcher.eval(&pos, 0), expected);
+            assert_eq!(searcher.eval(&pos, 0), expected);
+            let moves = pos.legal_moves();
+            if moves.is_empty() {
+                pos = Position::startpos();
+            } else {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                pos.do_move(moves[(rng % moves.len() as u64) as usize]);
+            }
+        }
+    }
 
     #[test]
     fn cached_neural_base_matches_uncached_evaluation() {

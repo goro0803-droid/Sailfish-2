@@ -20,7 +20,7 @@ panic = "abort"
 # 10/23 から s_check（実験S1）も既定（手元の基準。公開はまだ）。
 # 10/30 から s_prune2（実験S6 の軽い枝刈り）も既定（実験S13：singular の入った 3.0 の上で、AobaNNUE 相手 1,200局で +4.1ポイント）。
 # 10/31 から v_prelmp（実験 速さ2 の V11：LMP・futility を指す前に判定。読みは同じで約4.5%速い）も既定。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp"]
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -93,6 +93,9 @@ s_capsee = []
 # 実験 速さ2（10/30）：V11 LMP・futility を指す前に判定する（読みは変わらない）／V10 置換表の手を、手を作る前に試す
 v_prelmp = []
 v_ttfirst = []
+# 実験 速さ3（10/31）：V12 整数化したネットでは評価の最終の値を ecache に入れる（読みは変わらない）／H1 補助スレッドの探索状態を手をまたいで持ち越す
+v_fcache = []
+h_keep = []
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []
