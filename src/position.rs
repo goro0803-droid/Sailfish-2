@@ -403,7 +403,257 @@ impl Position {
 
     /// Exact one-ply checkmate, including quiet checks and legal drops.
     /// The input position is restored on every path; pawn-drop mate is rejected.
+    /// 実験 速い1手詰め（10/31）：答え（返す手も）は `mate_in_one_slow` と同じ。
+    /// 駒打ちは玉に利く升だけを調べ、逃げ道は手を作らずに `has_evasion` で調べる。
     pub fn mate_in_one(&mut self) -> Option<Move> {
+        let us = self.side;
+        let them = us ^ 1;
+        let ek = self.king[them];
+        if ek == NO_SQ {
+            return None;
+        }
+        // 王手になりうるのは、移動元か移動先が、相手の玉から見て縦・横・斜めの線上か桂の位置にある手だけ
+        let mut lines = 0u128;
+        for d in 0..10 {
+            let mut s = ek;
+            loop {
+                let n = NEIGHBOR[them][s][d];
+                if n < 0 {
+                    break;
+                }
+                s = n as usize;
+                lines |= 1 << s;
+                if d >= 8 {
+                    break;
+                }
+            }
+        }
+        let mut moves = MoveList::new();
+        self.gen_board_moves(&mut moves, false);
+        for i in 0..moves.len {
+            let m = moves.moves[i];
+            if lines & (1 << mv_from(m) | 1 << mv_to(m)) == 0 { continue; }
+            if !self.gives_check(m) || !self.do_move_legal(m) { continue; }
+            let escape = self.has_evasion();
+            self.undo_move();
+            if !escape { return Some(m); }
+        }
+        // 歩を打つ王手は、詰みなら打ち歩詰めで指せないので調べない（`mate_in_one_slow` でも返らない）
+        for pt in LANCE..=GOLD {
+            if self.hand[us][pt as usize] == 0 {
+                continue;
+            }
+            // pt を打つと相手の玉に利く空き升
+            let mut mask = 0u128;
+            let mut steps = STEP_MASK[pt as usize];
+            while steps != 0 {
+                let d = steps.trailing_zeros() as usize;
+                steps &= steps - 1;
+                let s = NEIGHBOR[them][ek][d];
+                if s >= 0 && self.board[s as usize] == 0 {
+                    mask |= 1 << s;
+                }
+            }
+            let mut slides = SLIDE_MASK[pt as usize];
+            while slides != 0 {
+                let d = slides.trailing_zeros() as usize;
+                slides &= slides - 1;
+                let mut s = ek;
+                loop {
+                    let n = NEIGHBOR[them][s][d];
+                    if n < 0 || self.board[n as usize] != 0 {
+                        break;
+                    }
+                    s = n as usize;
+                    mask |= 1 << s;
+                }
+            }
+            while mask != 0 {
+                let to = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let rr = rel_rank(us, to % 9);
+                let ok = match pt {
+                    LANCE => rr != 0,
+                    KNIGHT => rr > 1,
+                    _ => true,
+                };
+                let m = make_drop(pt, to);
+                if !ok || !self.do_move_legal(m) { continue; }
+                let escape = self.has_evasion();
+                self.undo_move();
+                if !escape { return Some(m); }
+            }
+        }
+        None
+    }
+
+    /// 手番 by の駒のうち、升 sq に利いている駒の升（方向ごとに最大1つなので最大10）
+    fn attackers_of(&self, sq: usize, by: usize, out: &mut [usize; 10]) -> usize {
+        let opp = by ^ 1;
+        let mut n = 0;
+        for d in 0..10 {
+            let a = NEIGHBOR[opp][sq][d];
+            if a < 0 {
+                continue;
+            }
+            let a = a as usize;
+            let p = self.board[a];
+            if p != 0 {
+                if color_of(p) == by {
+                    let pt = type_of(p) as usize;
+                    if (STEP_MASK[pt] | SLIDE_MASK[pt]) & (1 << d) != 0 {
+                        out[n] = a;
+                        n += 1;
+                    }
+                }
+                continue;
+            }
+            if d >= 8 {
+                continue;
+            }
+            let mut s = a;
+            loop {
+                let next = NEIGHBOR[opp][s][d];
+                if next < 0 {
+                    break;
+                }
+                s = next as usize;
+                let p = self.board[s];
+                if p != 0 {
+                    if color_of(p) == by && SLIDE_MASK[type_of(p) as usize] & (1 << d) != 0 {
+                        out[n] = s;
+                        n += 1;
+                    }
+                    break;
+                }
+            }
+        }
+        n
+    }
+
+    /// 手番側の駒を from から to へ動かしても、自玉が王手にならないか（盤を一時的に書き換えて調べる）
+    fn move_keeps_king_safe(&mut self, from: usize, to: usize) -> bool {
+        let us = self.side;
+        let pc = self.board[from];
+        let cap = self.board[to];
+        self.board[from] = 0;
+        self.board[to] = pc;
+        let k = if from == self.king[us] { to } else { self.king[us] };
+        let ok = !self.attacked(k, us ^ 1);
+        self.board[to] = cap;
+        self.board[from] = pc;
+        ok
+    }
+
+    /// 王手をかけられている手番側に、合法手があるか（手を作らずに調べる。`has_legal_move` と違い打ち歩詰めも見る）
+    fn has_evasion(&mut self) -> bool {
+        let us = self.side;
+        let them = us ^ 1;
+        let k = self.king[us];
+        // 玉が動く（取る手も含む）
+        let mut steps = STEP_MASK[KING as usize];
+        while steps != 0 {
+            let d = steps.trailing_zeros() as usize;
+            steps &= steps - 1;
+            let to = NEIGHBOR[us][k][d];
+            if to < 0 {
+                continue;
+            }
+            let to = to as usize;
+            let t = self.board[to];
+            if t != 0 && color_of(t) == us {
+                continue;
+            }
+            if self.move_keeps_king_safe(k, to) {
+                return true;
+            }
+        }
+        let mut checkers = [0usize; 10];
+        if self.attackers_of(k, them, &mut checkers) != 1 {
+            return false;
+        }
+        let c = checkers[0];
+        // 王手をかけた駒を、玉以外の駒で取る（成り・不成のどちらかは必ず指せる）
+        let mut att = [0usize; 10];
+        let na = self.attackers_of(c, us, &mut att);
+        for &a in &att[..na] {
+            if a != k && self.move_keeps_king_safe(a, c) {
+                return true;
+            }
+        }
+        // 飛び道具の王手なら、間の升に打つ・動く
+        let mut between = [0usize; 8];
+        let mut nb = 0;
+        for d in 0..8 {
+            let mut s = k;
+            nb = 0;
+            loop {
+                let n = NEIGHBOR[us][s][d];
+                if n < 0 {
+                    break;
+                }
+                s = n as usize;
+                if self.board[s] != 0 {
+                    break;
+                }
+                between[nb] = s;
+                nb += 1;
+            }
+            if s == c {
+                break;
+            }
+            nb = 0;
+        }
+        if nb == 0 {
+            return false;
+        }
+        let mut pawn_files = 0u16;
+        if self.hand[us][PAWN as usize] > 0 {
+            let own_pawn = make_piece(us, PAWN);
+            for f in 0..9 {
+                if (0..9).any(|r| self.board[f * 9 + r] == own_pawn) {
+                    pawn_files |= 1 << f;
+                }
+            }
+        }
+        for &s in &between[..nb] {
+            let rr = rel_rank(us, s % 9);
+            for pt in PAWN..=GOLD {
+                if self.hand[us][pt as usize] == 0 {
+                    continue;
+                }
+                let ok = match pt {
+                    PAWN => rr != 0 && pawn_files & (1 << (s / 9)) == 0,
+                    LANCE => rr != 0,
+                    KNIGHT => rr > 1,
+                    _ => true,
+                };
+                if !ok {
+                    continue;
+                }
+                // 相手の玉の前に歩を打つ手は、打ち歩詰めになりうるので指して確かめる
+                if pt == PAWN && NEIGHBOR[us][s][0] == self.king[them] as i8 {
+                    if self.do_move_legal(make_drop(PAWN, s)) {
+                        self.undo_move();
+                        return true;
+                    }
+                    continue;
+                }
+                return true;
+            }
+            let na = self.attackers_of(s, us, &mut att);
+            for &a in &att[..na] {
+                if a != k && self.move_keeps_king_safe(a, s) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 前の1手詰めの判定（すべての手を作り、王手のたびに相手の手もすべて指して確かめる）。テストで答えを比べる用
+    #[cfg(test)]
+    pub fn mate_in_one_slow(&mut self) -> Option<Move> {
         let mut moves = MoveList::new();
         self.gen_moves(&mut moves, false);
         for i in 0..moves.len {
@@ -504,6 +754,16 @@ impl Position {
     /// 疑似合法手を生成する（自玉が取られる手も含む）。
     /// captures_only の場合は駒を取る手だけ。
     pub fn gen_moves(&self, list: &mut MoveList, captures_only: bool) {
+        self.gen_board_moves(list, captures_only);
+        if captures_only {
+            return;
+        }
+        self.gen_drops(list);
+    }
+
+    /// 盤上の駒を動かす疑似合法手（`gen_moves` の前半。順番も同じ）
+    #[inline(always)]
+    fn gen_board_moves(&self, list: &mut MoveList, captures_only: bool) {
         let us = self.side;
         for from in 0..81 {
             let p = self.board[from];
@@ -557,12 +817,12 @@ impl Position {
                 }
             }
         }
+    }
 
-        if captures_only {
-            return;
-        }
-
-        // 駒打ち
+    /// 駒打ちの疑似合法手（`gen_moves` の後半。順番も同じ）
+    #[inline(always)]
+    fn gen_drops(&self, list: &mut MoveList) {
+        let us = self.side;
         let mut pawn_files = 0u16;
         if self.hand[us][PAWN as usize] > 0 {
             let own_pawn = make_piece(us, PAWN);
@@ -1013,6 +1273,38 @@ mod tactical_tests {
         assert!(pawn.mate_in_one().is_none());
         let mut escape = Position::from_sfen("4k4/9/9/9/9/9/9/9/4K4 b R 1").unwrap();
         assert!(escape.mate_in_one().is_none());
+    }
+
+    #[test]
+    fn fast_mate_in_one_matches_slow_version() {
+        // ランダムに進めた局面と、その局面から王手を1つ指した後の局面（逃げ道を調べる側の当たりが増える）で比べる
+        let mut pos = Position::startpos();
+        let mut rng = 987654321u64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        let (mut mates, mut checked) = (0, 0);
+        for _ in 0..20000 {
+            let original = (pos.board, pos.hand, pos.side, pos.king, pos.key);
+            let fast = pos.mate_in_one();
+            assert_eq!((pos.board, pos.hand, pos.side, pos.king, pos.key), original);
+            assert_eq!(fast, pos.mate_in_one_slow(), "{}", pos.display());
+            checked += 1;
+            if fast.is_some() { mates += 1; }
+            let legal = pos.legal_moves();
+            if legal.is_empty() || pos.history.len() > 300 {
+                pos = Position::startpos();
+                continue;
+            }
+            // 駒の取り合いが進んで持ち駒が増えるよう、取る手を選びやすくする
+            let caps: Vec<Move> = legal.iter().copied().filter(|&m| !mv_is_drop(m) && pos.board[mv_to(m)] != 0).collect();
+            let m = if !caps.is_empty() && next(3) != 0 { caps[next(caps.len())] } else { legal[next(legal.len())] };
+            pos.do_move(m);
+        }
+        assert!(checked == 20000 && mates > 200, "mates {}", mates);
     }
 }
 

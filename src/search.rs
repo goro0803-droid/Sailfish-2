@@ -1166,9 +1166,19 @@ impl Searcher {
             }
         }
 
+        let in_check = pos.in_check();
+        // 実験 速い1手詰め S（cargo の機能 m_mate1s）：根でなく、王手をかけられておらず置換表に無い局面は、1手詰めを確かめる
+        if cfg!(feature = "m_mate1s") && ply > 0 && excluded == MOVE_NONE && tt_entry.is_none() && !in_check {
+            if let Some(m) = pos.mate_in_one() {
+                let s = MATE - ply as i32 - 1;
+                self.pv[ply * PV_STRIDE] = m;
+                self.pv_len[ply] = 1;
+                prof!(self, 10, self.tt.store(key, m, score_to_tt(s, ply), depth, BOUND_EXACT));
+                return s;
+            }
+        }
         // ここから先でこの局面のアキュムレータが要る（評価と、子の局面への更新の元になる）
         self.ensure_acc(pos, ply);
-        let in_check = pos.in_check();
         let mut static_eval = if in_check { -INF } else { self.eval(pos, ply) };
         // 評価補正履歴（cargo の機能 corrhist）：補正前の値と添字を控え、表の値を足す
         if cfg!(feature = "corrhist") && !in_check && static_eval.abs() < MATE_BOUND {
@@ -1248,6 +1258,34 @@ impl Searcher {
                     ts!(self, null_cut);
                     tsd!(self, d_null_cut, d0);
                     return if s >= MATE_BOUND { beta } else { s };
+                }
+            }
+            // 実験P2（cargo の機能 p_probcut）：β+200 を超えそうな駒取りを、静止探索 → 4手浅い探索で確かめ、超えれば打ち切る
+            if cfg!(feature = "p_probcut") && depth >= 5 && beta.abs() < MATE_BOUND {
+                let rbeta = beta + 200;
+                let skip = matches!(tt_entry, Some(e) if e.depth as i32 >= depth - 3 && score_from_tt(e.score as i32, ply) < rbeta);
+                if !skip {
+                    let mut caps = MoveList::new();
+                    pos.gen_moves(&mut caps, true);
+                    for i in 0..caps.len {
+                        let m = caps.moves[i];
+                        if self.exchange_score(pos, m) < rbeta - static_eval { continue; }
+                        let piece = if mv_is_drop(m) { make_piece(pos.side, mv_drop_pt(m)) } else { pos.board[mv_from(m)] };
+                        self.set_pending(pos, m, ply);
+                        if !pos.do_move_legal(m) { continue; }
+                        self.ss_pm[ply] = (piece, mv_to(m));
+                        if cfg!(feature = "s_sing2") { self.dext[ply + 1] = self.dext[ply]; }
+                        let mut s = -self.qsearch(pos, -rbeta, -rbeta + 1, ply + 1, 0);
+                        if s >= rbeta {
+                            s = -self.negamax(pos, -rbeta, -rbeta + 1, depth - 4, ply + 1, true);
+                        }
+                        pos.undo_move();
+                        if self.stopped { return 0; }
+                        if s >= rbeta {
+                            self.tt.store(key, m, score_to_tt(s, ply), depth - 3, BOUND_LOWER);
+                            return s;
+                        }
+                    }
                 }
             }
         }
@@ -1375,7 +1413,9 @@ impl Searcher {
             } else {
                 let lmp_base = tp(5) + depth * depth * tp(6);
                 let lmp_limit = if imp_on && !improving { lmp_base * 2 / 3 } else { lmp_base };
-                depth <= tp(7) && n > lmp_limit
+                // 実験P1（cargo の機能 p_lmp5）：今の 4+3d² のまま、深さ5まで広げる
+                let lmp_depth = if cfg!(feature = "p_lmp5") { 5 } else { tp(7) };
+                depth <= lmp_depth && n > lmp_limit
             }
         };
         // 実験V11（cargo の機能 v_prelmp）：LMP・futility を指す前に判定できる局面か（戦術の守りと診断が無効のとき）
@@ -1557,6 +1597,19 @@ impl Searcher {
                     if imp_on && !improving {
                         r += 1;
                     }
+                    // 実験 LMR（10/31）：L1 `l_nonpv` PV でない局面で +1／L2 `l_nonpv2` PV でない局面の、キラー手でなく
+                    // ヒストリーが 0 以下の手だけ +1、さらに置換表の手が駒取りなら +1
+                    if cfg!(feature = "l_nonpv") && !pv_node {
+                        r += 1;
+                    }
+                    if cfg!(feature = "l_nonpv2") && !pv_node {
+                        if self.killers[ply][0] != m && self.killers[ply][1] != m && self.history[piece as usize * 81 + to] <= 0 {
+                            r += 1;
+                        }
+                        if tt_capture {
+                            r += 1;
+                        }
+                    }
                     if cfg!(feature = "s_lmr") {
                         // 実験S3（cargo の機能 s_lmr）：PV でない局面・置換表の手が駒取りの局面では深めに減らし、
                         // ヒストリーの良し悪しに応じて減らす量を連続的に変える（やねうら王の cutNode・ttCapture・statScore の考え方）
@@ -1568,6 +1621,9 @@ impl Searcher {
                         }
                         let div = if cfg!(feature = "s_conthist") { 16384 } else { 8192 };
                         r -= self.quiet_stat(piece, to, ply) / div;
+                    } else if cfg!(feature = "c_lmrstat") {
+                        // 実験 継続ヒストリーの作り直し C2（cargo の機能 c_lmrstat）：継続ヒストリーも含めた合計が良い手ほど浅くしない（増やす方向には使わない）
+                        r -= self.quiet_stat(piece, to, ply).max(0) / 8192;
                     } else if self.history[piece as usize * 81 + to] > tp(12) {
                         // ヒストリーの良い手は浅くしすぎない
                         r -= 1;
