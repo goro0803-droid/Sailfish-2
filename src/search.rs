@@ -330,6 +330,21 @@ const PV_STRIDE: usize = MAX_PLY + 2;
 /// 欄：0 手の生成（通常）／1 手の生成（静止探索）／2 並べ替えの点数づけ／3 指す（合法の確認こみ）／4 戻す／5 王手になるかの判定／
 /// 6 SEE／7 アキュムレータの更新／8 評価／9 置換表を引く／10 置換表に書く／11 千日手の判定／12 入玉宣言の判定／13 手を選ぶ／14 思考の全体／
 /// 15 LMP・futility で省いた手を戻す（指す方は 3 に入る）／16 手作りの評価（覚えておいた値が使えず計算した分。8 の内数）
+/// 実験 速さ4 V16（cargo の機能 v_lazychk）：指す前の王手の判定を、要るときだけ行う（一度調べたら覚えておく。値は同じ）
+macro_rules! pre_check {
+    ($c:ident, $on:expr, $s:expr, $pos:expr, $m:expr) => {
+        match $c {
+            Some(v) => v,
+            None => {
+                let v = $on && prof!($s, 5, $pos.gives_check($m));
+                #[allow(unused_assignments)]
+                { $c = Some(v); }
+                v
+            }
+        }
+    };
+}
+
 macro_rules! prof {
     ($s:expr, $i:expr, $e:expr) => {{
         if cfg!(feature = "prof") {
@@ -1049,6 +1064,16 @@ impl Searcher {
         prof!(self, 6, if self.feat & F_SEE_HAND != 0 { pos.see_with_hand(m) } else { pos.see(m) })
     }
 
+    /// SEE が t 以上か（`exchange_score(pos, m) >= t` と同じ。実験 速さ4 V14 v_seefast では見積もりで決まれば数えない）
+    #[inline]
+    fn exchange_ge(&self, pos: &Position, m: Move, t: i32) -> bool {
+        if cfg!(feature = "v_seefast") {
+            prof!(self, 6, pos.see_ge(m, t, self.feat & F_SEE_HAND != 0))
+        } else {
+            self.exchange_score(pos, m) >= t
+        }
+    }
+
     // Only prioritize a hypothesis; the ordinary search must still refute it.
     // Include captures, blocks and king escapes among all legal replies.
     fn prepare_goal_moves(&mut self, pos: &mut Position, root_moves: &[Move]) {
@@ -1109,10 +1134,11 @@ impl Searcher {
                 } else { -attacker / 16 };
                 let base = victim * 16 + tiebreak + if mv_is_promo(m) { 1000 } else { 0 };
                 // 取り合いで損をする駒取りは、静かな手より後ろに回す
-                let see = if self.feat & (F_SEE_HAND | F_SEE_HAND_ORDER) != 0 {
-                    pos.see_with_hand(m)
-                } else { pos.see(m) };
-                if see >= 0 { 200_000 + base } else { -60_000 + base }
+                let hand = self.feat & (F_SEE_HAND | F_SEE_HAND_ORDER) != 0;
+                let see_ok = if cfg!(feature = "v_seefast") {
+                    pos.see_ge(m, 0, hand)
+                } else if hand { pos.see_with_hand(m) >= 0 } else { pos.see(m) >= 0 };
+                if see_ok { 200_000 + base } else { -60_000 + base }
             } else if mv_is_promo(m) {
                 150_000
             } else if ply == 0 && self.feat & F_GOAL_ORDER != 0
@@ -1508,11 +1534,14 @@ impl Searcher {
                 continue;
             }
             // 指す前の王手の判定は、実験S2・S6 のときだけ（S1 の延長は、指した後に王手かどうかで決める。実験 V6）
-            let pre_check = (cfg!(feature = "s_prune") || cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee"))
-                && prof!(self, 5, pos.gives_check(m));
+            let pre_check_on = cfg!(feature = "s_prune") || cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee");
+            let mut pre_check: Option<bool> = None;
+            if !cfg!(feature = "v_lazychk") {
+                let _ = pre_check!(pre_check, pre_check_on, self, pos, m);
+            }
             // 実験S13（cargo の機能 s_capsee）：S2 のうち、取り合いで大きく損をする駒取り・成り・王手を指す前に省く部分だけ
             if cfg!(feature = "s_capsee") && ply > 0 && excluded == MOVE_NONE && !in_check && best > -MATE_BOUND
-                && (is_cap || is_promo || pre_check) && self.exchange_score(pos, m) < -218 * depth
+                && (is_cap || is_promo || pre_check!(pre_check, pre_check_on, self, pos, m)) && self.exchange_score(pos, m) < -218 * depth
             {
                 pruned += 1;
                 continue;
@@ -1520,7 +1549,7 @@ impl Searcher {
             // 実験S2（cargo の機能 s_prune）：指す前の省略（やねうら王の Step 13 と同じ考え方）
             if cfg!(feature = "s_prune") && ply > 0 && excluded == MOVE_NONE && !in_check && best > -MATE_BOUND {
                 let mc = legal + pruned + 1;
-                if is_cap || is_promo || pre_check {
+                if is_cap || is_promo || pre_check!(pre_check, pre_check_on, self, pos, m) {
                     // 取り合いで大きく損をする駒取り・成り・王手
                     if self.exchange_score(pos, m) < -218 * depth {
                         pruned += 1;
@@ -1542,8 +1571,8 @@ impl Searcher {
             if cfg!(feature = "s_prune2") && ply > 0 && !pv_node && excluded == MOVE_NONE && !in_check
                 && best > -MATE_BOUND && depth <= 6
             {
-                let limit = if is_cap || is_promo || pre_check { -218 * depth } else if depth <= 4 { -21 * depth * depth - 21 * depth } else { i32::MIN };
-                if limit > i32::MIN && self.exchange_score(pos, m) < limit {
+                let limit = if is_cap || is_promo || pre_check!(pre_check, pre_check_on, self, pos, m) { -218 * depth } else if depth <= 4 { -21 * depth * depth - 21 * depth } else { i32::MIN };
+                if limit > i32::MIN && !self.exchange_ge(pos, m, limit) {
                     continue;
                 }
             }
@@ -1554,7 +1583,7 @@ impl Searcher {
                 let lmp = self.feat & D_NO_LMP == 0 && lmp_hit(n);
                 let fut = !lmp && self.feat & D_NO_FUTILITY == 0 && depth <= tp(4) && n > 1
                     && static_eval + tp(2) + tp(3) * depth <= alpha;
-                if (lmp || fut) && !(if cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee") { pre_check } else { prof!(self, 5, pos.gives_check(m)) }) {
+                if (lmp || fut) && !(if cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee") { pre_check!(pre_check, pre_check_on, self, pos, m) } else { prof!(self, 5, pos.gives_check(m)) }) {
                     if pos.is_legal_quiet(m) {
                         legal += 1;
                         if lmp { ts!(self, lmp); } else { ts!(self, fut); }
@@ -1565,7 +1594,7 @@ impl Searcher {
             let escape = guard_on && quiet && !mv_is_drop(m)
                 && threats.hanging_from(pos, mv_from(m));
             let safe_reply = guard_on && quiet && (escape || threats.majors != 0)
-                && pos.see(m) >= 0;
+                && if cfg!(feature = "v_seefast") { pos.see_ge(m, 0, false) } else { pos.see(m) >= 0 };
             self.set_pending(pos, m, ply);
             let cap_type = if is_cap { type_of(pos.board[to]) } else { 0 };
             if !prof!(self, 3, pos.do_move_legal(m)) {
@@ -1578,7 +1607,7 @@ impl Searcher {
             // SEE は指す前の局面で調べるので、王手のときだけ戻して調べ、指し直す（実験 V6）
             let check_ext = cfg!(feature = "s_check") && gives_check && ply < (2 * self.iteration_depth) as usize && {
                 pos.undo_move();
-                let ok = self.exchange_score(pos, m) >= 0;
+                let ok = self.exchange_ge(pos, m, 0);
                 pos.do_move(m);
                 ok
             };
@@ -1921,7 +1950,7 @@ impl Searcher {
                     continue;
                 }
                 // 取り合いで損をする駒取りは読まない
-                if !checking && self.feat & D_NO_QSEE == 0 && self.exchange_score(pos, m) < 0 {
+                if !checking && self.feat & D_NO_QSEE == 0 && !self.exchange_ge(pos, m, 0) {
                     continue;
                 }
                 if !checking {

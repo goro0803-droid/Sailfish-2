@@ -1,5 +1,6 @@
 //! Sailfish の探索・評価・局面の実装（USI エンジン本体と、評価関数の学習ツールが共有する）
 
+pub mod bb;
 pub mod book;
 pub mod eval;
 #[cfg(feature = "ext_eval")]

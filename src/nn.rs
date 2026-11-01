@@ -366,6 +366,50 @@ unsafe fn q_update_avx2(v: &mut [i16; H], row: &[i16; H], plus: bool) {
     }
 }
 
+/// 実験 速さ4 V13：指す前のアキュムレータ src に、ops の行（特徴番号と、足すなら true）を順に足し引きして dst に書く。
+/// 16要素ずつ読み、全部の行を足してから1回だけ書く。要素ごとの飽和演算の順番は1行ずつのときと同じなので、値も同じ
+#[inline]
+fn q_apply(q: &QNet, src: &[i16; H], dst: &mut [i16; H], ops: &[(usize, bool)]) {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 の有無を実行時に確かめた。H は 16 の倍数で、特徴番号は w1 の範囲内。
+        unsafe { q_apply_avx2(q, src, dst, ops) };
+        return;
+    }
+    *dst = *src;
+    for &(f, plus) in ops {
+        q_update_scalar(dst, q.row(f), plus);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q_apply_avx2(q: &QNet, src: &[i16; H], dst: &mut [i16; H], ops: &[(usize, bool)]) {
+    use std::arch::x86_64::*;
+    let w = q.w1.as_ptr();
+    for i in (0..H).step_by(16) {
+        let mut a = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+        for &(f, plus) in ops {
+            let b = _mm256_loadu_si256(w.add(f * H + i) as *const __m256i);
+            a = if plus { _mm256_adds_epi16(a, b) } else { _mm256_subs_epi16(a, b) };
+        }
+        _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, a);
+    }
+}
+
+/// V13：盤上の駒1つの特徴を、視点ごとの足し引きの並びに加える（`Network::piece` と同じ順番）
+#[inline]
+fn push_piece_ops(ops: &mut [[(usize, bool); 12]; 2], n: &mut [usize; 2], plus: bool, color: usize, pt: u8, sq: usize, kings: [usize; 2]) {
+    let mut f = [0usize; 3];
+    for persp in 0..2 {
+        let k = piece_feats(persp, color, pt, sq, kings, &mut f);
+        for &i in &f[..k] {
+            ops[persp][n[persp]] = (i, plus);
+            n[persp] += 1;
+        }
+    }
+}
+
 /// 整数のネットの出力（土台を足す前）。第2層までは整数で計算するので、AVX2 とスカラーの結果は完全に一致する
 fn forward_q_scalar(q: &QNet, acc: &Acc, stm: usize) -> f32 {
     let mut x = [0i16; 2 * H];
@@ -602,13 +646,25 @@ impl Network {
     /// 手 m を指したあとの局面 pos と、指す前のアキュムレータ from から、指したあとのアキュムレータ to を作る。
     /// cap は m で取った駒（取らなければ 0）。指したあとの盤からは取った駒がわからないので、別に渡す。
     pub fn apply_after(&self, from: &Acc, pos: &Position, m: Move, cap: u8, to: &mut Acc) {
-        let us = pos.side ^ 1; // 指した側
         let dst = mv_to(m);
         // 玉が動くと、玉からの相対位置の特徴がすべて変わるので、作り直す（玉の移動は少ない）
         if !mv_is_drop(m) && type_of(pos.board[dst]) == KING {
             self.refresh_arrays(&pos.board, &pos.hand, pos.king, to);
             return;
         }
+        if cfg!(feature = "v_accfuse") {
+            if let Some(q) = &self.q {
+                Self::apply_after_q(q, from, pos, m, cap, to);
+                return;
+            }
+        }
+        self.apply_after_rows(from, pos, m, cap, to);
+    }
+
+    /// 差分更新を1行ずつ行う（玉が動いた手は呼ぶ前に除く）。V13 の比べる相手としてテストでも使う
+    fn apply_after_rows(&self, from: &Acc, pos: &Position, m: Move, cap: u8, to: &mut Acc) {
+        let us = pos.side ^ 1;
+        let dst = mv_to(m);
         to.copy_from(from, self.q.is_some());
         let kings = pos.king;
         let sign = if us == BLACK { 1 } else { -1 };
@@ -640,6 +696,50 @@ impl Network {
                 to.mat += sign * (HAND_VALUE[hpt as usize] + PIECE_VALUE[cpt as usize]);
             }
         }
+    }
+
+    /// V13：整数化したネットの差分更新を、視点ごとに1回の読み書きで行う（玉が動いた手は呼ぶ前に除く）。
+    /// 足し引きの順番と駒割りの計算は `apply_after` と同じ
+    fn apply_after_q(q: &QNet, from: &Acc, pos: &Position, m: Move, cap: u8, to: &mut Acc) {
+        let us = pos.side ^ 1;
+        let dst = mv_to(m);
+        let kings = pos.king;
+        let sign = if us == BLACK { 1 } else { -1 };
+        let mut ops = [[(0usize, false); 12]; 2];
+        let mut n = [0usize; 2];
+        let mut mat = from.mat;
+        if mv_is_drop(m) {
+            let pt = mv_drop_pt(m);
+            let before = (pos.hand[us][pt as usize] as usize + 1).min(HAND_CAP[pt as usize]);
+            for persp in 0..2 {
+                ops[persp][n[persp]] = (hand_feat(persp, us, pt, before, kings), false);
+                n[persp] += 1;
+            }
+            push_piece_ops(&mut ops, &mut n, true, us, pt, dst, kings);
+            mat += sign * (PIECE_VALUE[pt as usize] - HAND_VALUE[pt as usize]);
+        } else {
+            let src = mv_from(m);
+            let npt = type_of(pos.board[dst]);
+            let pt = if mv_is_promo(m) { npt - PROMOTE } else { npt };
+            push_piece_ops(&mut ops, &mut n, false, us, pt, src, kings);
+            push_piece_ops(&mut ops, &mut n, true, us, npt, dst, kings);
+            mat += sign * (PIECE_VALUE[npt as usize] - PIECE_VALUE[pt as usize]);
+            if cap != 0 {
+                let cpt = type_of(cap);
+                push_piece_ops(&mut ops, &mut n, false, color_of(cap), cpt, dst, kings);
+                let hpt = unpromote(cpt);
+                let k = (pos.hand[us][hpt as usize] as usize).min(HAND_CAP[hpt as usize]);
+                for persp in 0..2 {
+                    ops[persp][n[persp]] = (hand_feat(persp, us, hpt, k, kings), true);
+                    n[persp] += 1;
+                }
+                mat += sign * (HAND_VALUE[hpt as usize] + PIECE_VALUE[cpt as usize]);
+            }
+        }
+        for persp in 0..2 {
+            q_apply(q, &from.q[persp], &mut to.q[persp], &ops[persp][..n[persp]]);
+        }
+        to.mat = mat;
     }
 
     /// ネットワークの出力（土台を足す前、-1〜1 くらいの値）
@@ -1111,6 +1211,45 @@ mod tests {
                         assert_eq!(net.forward_raw(&next, stm).to_bits(), scalar.to_bits(), "AVX2 とスカラーが合わない");
                     }
                     acc = next;
+                }
+            }
+        }
+    }
+
+    /// V13：まとめた差分更新は、1行ずつの差分更新と（飽和するときも）完全に同じ値になる
+    #[test]
+    fn fused_quant_update_matches_row_by_row() {
+        for mut net in test_nets(7) {
+            // 倍率を大きくして、アキュムレータが飽和する場面も作る
+            for s1 in [Q_S1, 16384] {
+                net.set_quant_scales(true, s1, Q_S2);
+                let q = net.q.as_ref().unwrap();
+                let mut rng = 777u64;
+                for _game in 0..30 {
+                    let mut pos = Position::startpos();
+                    let mut acc = Acc::default();
+                    net.refresh(&pos, &mut acc);
+                    for _ in 0..200 {
+                        let moves = pos.legal_moves();
+                        if moves.is_empty() { break; }
+                        rng ^= rng << 13;
+                        rng ^= rng >> 7;
+                        rng ^= rng << 17;
+                        let m = moves[(rng % moves.len() as u64) as usize];
+                        let cap = if mv_is_drop(m) { 0 } else { pos.board[mv_to(m)] };
+                        pos.do_move(m);
+                        let mut next = Acc::default();
+                        if !mv_is_drop(m) && type_of(pos.board[mv_to(m)]) == KING {
+                            net.refresh(&pos, &mut next);
+                        } else {
+                            let mut rows = Acc::default();
+                            net.apply_after_rows(&acc, &pos, m, cap, &mut rows);
+                            Network::apply_after_q(q, &acc, &pos, m, cap, &mut next);
+                            assert_eq!(next.q, rows.q, "まとめた差分更新が1行ずつと合わない");
+                            assert_eq!(next.mat, rows.mat);
+                        }
+                        acc = next;
+                    }
                 }
             }
         }

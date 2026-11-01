@@ -62,7 +62,7 @@ pub fn rel_rank(c: usize, rank: usize) -> usize {
 }
 
 // 先手視点の方向 (筋の増分, 段の増分)。8,9 は桂馬跳び。
-const DIRS: [(i32, i32); 10] = [
+pub(crate) const DIRS: [(i32, i32); 10] = [
     (0, -1),
     (-1, -1),
     (1, -1),
@@ -102,7 +102,7 @@ pub const SLIDE_MASK: [u16; 15] = [
 /// NEIGHBOR[手番][升][方向] = 移動先の升（盤外なら -1）
 pub static NEIGHBOR: [[[i8; 10]; 81]; 2] = build_neighbors();
 
-const fn build_neighbors() -> [[[i8; 10]; 81]; 2] {
+pub(crate) const fn build_neighbors() -> [[[i8; 10]; 81]; 2] {
     let mut t = [[[-1i8; 10]; 81]; 2];
     let mut c = 0;
     while c < 2 {

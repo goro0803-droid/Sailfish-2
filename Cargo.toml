@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "3.0.0"
+version = "3.1.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
@@ -20,7 +20,8 @@ panic = "abort"
 # 10/23 から s_check（実験S1）も既定（手元の基準。公開はまだ）。
 # 10/30 から s_prune2（実験S6 の軽い枝刈り）も既定（実験S13：singular の入った 3.0 の上で、AobaNNUE 相手 1,200局で +4.1ポイント）。
 # 10/31 から v_prelmp（実験 速さ2 の V11：LMP・futility を指す前に判定。読みは同じで約4.5%速い）も既定。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep"]
+# 11/1 から h_keep（実験 速さ3 の H1）と、ビットボードの v_bb・v_bbsee・v_bbgen（実験 速さ4 の V17〜V19。読みは同じで約1.18倍）も既定。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -96,6 +97,24 @@ v_ttfirst = []
 # 実験 速さ3（10/31）：V12 整数化したネットでは評価の最終の値を ecache に入れる（読みは変わらない）／H1 補助スレッドの探索状態を手をまたいで持ち越す
 v_fcache = []
 h_keep = []
+# 実験 速さ4（11/1）：V13 差分更新で足す・引く行を、1回の読み書きにまとめる（飽和演算の順番は同じなので読みは変わらない）
+v_accfuse = []
+# 実験 速さ4（11/1）：V14 SEE の線を使い回し、閾値と比べるだけの所は上と下の見積もりで決まれば数えない（結果は同じ）
+v_seefast = []
+# 実験 速さ4（11/1）：V15 手作りの評価で、駒のある升だけをたどる（足す順番が違うだけで値は同じ）
+v_evalfast = []
+# 実験 速さ4（11/1）：V16 指す前の王手の判定を、枝刈り・LMP の条件で要るときだけ行う（値は同じ）
+v_lazychk = []
+# 実験 速さ4（11/1〜）：V17 ビットボード。盤の横に駒の印（u128）を持ち、升に利いているかの判定を印で行う（値は同じ）
+v_bb = []
+# V18：SEE で取り合いの升に利いている駒を、印で一度に求める（選ぶ駒と値は同じ）
+v_bbsee = ["v_bb"]
+# V19：手の生成で、自分の駒のある升・打てる空き升だけを印でたどる（手の順番は同じ）
+v_bbgen = ["v_bb"]
+# V20：手作りの評価の利きの数を、駒ごとの利きの印とビットごとの足し算で数える（値は同じ）
+v_bbeval = ["v_bb"]
+# V21：指す前の王手の判定を、盤を書き換えずに印の写しで行う（値は同じ）
+v_bbchk = ["v_bb"]
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []

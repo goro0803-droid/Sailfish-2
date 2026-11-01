@@ -41,6 +41,9 @@ pub struct Position {
     pub side: usize,
     pub king: [usize; 2],
     pub key: u64,
+    /// 実験 速さ4 V17（cargo の機能 v_bb）：手番・駒種ごとの駒のある升の印と、全部の駒の印（機能なしでは使わず、更新もしない）
+    pub bb: [[u128; 15]; 2],
+    pub occ: u128,
     history: Vec<StateInfo>,
 }
 
@@ -76,6 +79,8 @@ impl Position {
             side: BLACK,
             king: [NO_SQ; 2],
             key: 0,
+            bb: [[0; 15]; 2],
+            occ: 0,
             history: Vec::with_capacity(1024),
         };
 
@@ -128,6 +133,7 @@ impl Position {
         }
 
         pos.key = pos.compute_key();
+        pos.rebuild_bb();
         Ok(pos)
     }
 
@@ -137,8 +143,9 @@ impl Position {
         for (sq, &p) in board.iter().enumerate() {
             if p != 0 && type_of(p) == KING { king[color_of(p)] = sq; }
         }
-        let mut pos = Position { board, hand, side, king, key: 0, history: Vec::with_capacity(1024) };
+        let mut pos = Position { board, hand, side, king, key: 0, bb: [[0; 15]; 2], occ: 0, history: Vec::with_capacity(1024) };
         pos.key = pos.compute_key();
+        pos.rebuild_bb();
         pos
     }
 
@@ -161,6 +168,40 @@ impl Position {
         k
     }
 
+    /// 盤から印を作り直す（v_bb のとき）
+    fn rebuild_bb(&mut self) {
+        self.bb = [[0; 15]; 2];
+        self.occ = 0;
+        if cfg!(feature = "v_bb") {
+            for sq in 0..81 {
+                let p = self.board[sq];
+                if p != 0 {
+                    self.bb[color_of(p)][type_of(p) as usize] |= 1u128 << sq;
+                    self.occ |= 1u128 << sq;
+                }
+            }
+        }
+    }
+
+    /// 升 sq の駒を p にする（v_bb のときは印も直す）。盤を書き換えるときは必ずこれを使う
+    #[inline(always)]
+    fn set_sq(&mut self, sq: usize, p: u8) {
+        if cfg!(feature = "v_bb") {
+            let bit = 1u128 << sq;
+            let old = self.board[sq];
+            if old != 0 {
+                self.bb[color_of(old)][type_of(old) as usize] ^= bit;
+            }
+            if p != 0 {
+                self.bb[color_of(p)][type_of(p) as usize] ^= bit;
+                self.occ |= bit;
+            } else {
+                self.occ &= !bit;
+            }
+        }
+        self.board[sq] = p;
+    }
+
     #[inline]
     fn add_hand(&mut self, c: usize, pt: u8, delta: i8) {
         let pt = pt as usize;
@@ -178,7 +219,7 @@ impl Position {
             let pt = mv_drop_pt(m);
             self.add_hand(us, pt, -1);
             let p = make_piece(us, pt);
-            self.board[to] = p;
+            self.set_sq(to, p);
             self.key ^= ZOB.psq[p as usize][to];
         } else {
             let from = mv_from(m);
@@ -190,9 +231,9 @@ impl Position {
                 self.add_hand(us, unpromote(type_of(cap)), 1);
             }
             self.key ^= ZOB.psq[p as usize][from];
-            self.board[from] = 0;
+            self.set_sq(from, 0);
             let np = if mv_is_promo(m) { p + PROMOTE } else { p };
-            self.board[to] = np;
+            self.set_sq(to, np);
             self.key ^= ZOB.psq[np as usize][to];
             if type_of(p) == KING {
                 self.king[us] = to;
@@ -210,14 +251,14 @@ impl Position {
         let m = st.mv;
         let to = mv_to(m);
         if mv_is_drop(m) {
-            self.board[to] = 0;
+            self.set_sq(to, 0);
             self.hand[us][mv_drop_pt(m) as usize] += 1;
         } else {
             let from = mv_from(m);
             let p = self.board[to];
             let orig = if mv_is_promo(m) { p - PROMOTE } else { p };
-            self.board[from] = orig;
-            self.board[to] = st.captured;
+            self.set_sq(from, orig);
+            self.set_sq(to, st.captured);
             if st.captured != 0 {
                 self.hand[us][unpromote(type_of(st.captured)) as usize] -= 1;
             }
@@ -241,7 +282,89 @@ impl Position {
     }
 
     /// 升 sq に手番 by の駒が利いているか
+    #[inline]
     pub fn attacked(&self, sq: usize, by: usize) -> bool {
+        if cfg!(feature = "v_bb") { self.attacked_bb(sq, by) } else { self.attacked_slow(sq, by) }
+    }
+
+    /// 実験 速さ4 V17：`attacked_slow` と同じ判定を印で行う。1升の動きは表を引いて一度に、走る駒は線のいちばん近い駒だけを見る
+    #[inline]
+    fn attacked_bb(&self, sq: usize, by: usize) -> bool {
+        Self::attacked_by_sets(&self.bb[by], self.occ, sq, by)
+    }
+
+    /// 手番 by の駒の印が b、駒のある升が occ のとき、升 sq に利いているか
+    #[inline(always)]
+    fn attacked_by_sets(b: &[u128; 15], occ: u128, sq: usize, by: usize) -> bool {
+        use crate::bb::{first_on_ray, BB};
+        let rs = &BB.rev_step[by];
+        let golds = b[GOLD as usize] | b[PRO_PAWN as usize] | b[PRO_LANCE as usize] | b[PRO_KNIGHT as usize] | b[PRO_SILVER as usize];
+        let step = (rs[PAWN as usize][sq] & b[PAWN as usize])
+            | (rs[KNIGHT as usize][sq] & b[KNIGHT as usize])
+            | (rs[SILVER as usize][sq] & b[SILVER as usize])
+            | (rs[GOLD as usize][sq] & golds)
+            | (rs[KING as usize][sq] & b[KING as usize])
+            | (rs[HORSE as usize][sq] & b[HORSE as usize])
+            | (rs[DRAGON as usize][sq] & b[DRAGON as usize]);
+        if step != 0 {
+            return true;
+        }
+        let hit = |set: u128, g: usize| matches!(first_on_ray(occ, g, sq), Some(s) if (set >> s) & 1 != 0);
+        let rooks = b[ROOK as usize] | b[DRAGON as usize];
+        if rooks & BB.rook_reach[sq] != 0 && (hit(rooks, 0) || hit(rooks, 3) || hit(rooks, 4) || hit(rooks, 7)) {
+            return true;
+        }
+        let bishops = b[BISHOP as usize] | b[HORSE as usize];
+        if bishops & BB.bishop_reach[sq] != 0 && (hit(bishops, 1) || hit(bishops, 2) || hit(bishops, 5) || hit(bishops, 6)) {
+            return true;
+        }
+        // 手番 by の香は、先手なら sq の下（方向 7）、後手なら上（方向 0）から利く
+        let lances = b[LANCE as usize];
+        let g = if by == BLACK { 7 } else { 0 };
+        lances & BB.ray[g][sq] != 0 && hit(lances, g)
+    }
+
+    /// 実験 速さ4 V18：手番 by の駒のうち、駒のある升が occ（取り合いで消えた駒を除いたもの）のとき、升 sq に利いている駒の升
+    fn attackers_bb(&self, sq: usize, by: usize, occ: u128) -> u128 {
+        use crate::bb::{first_on_ray, BB};
+        let b = &self.bb[by];
+        let rs = &BB.rev_step[by];
+        let m = |pt: u8| b[pt as usize] & occ;
+        let golds = m(GOLD) | m(PRO_PAWN) | m(PRO_LANCE) | m(PRO_KNIGHT) | m(PRO_SILVER);
+        let mut a = (rs[PAWN as usize][sq] & m(PAWN))
+            | (rs[KNIGHT as usize][sq] & m(KNIGHT))
+            | (rs[SILVER as usize][sq] & m(SILVER))
+            | (rs[GOLD as usize][sq] & golds)
+            | (rs[KING as usize][sq] & m(KING))
+            | (rs[HORSE as usize][sq] & m(HORSE))
+            | (rs[DRAGON as usize][sq] & m(DRAGON));
+        let rooks = m(ROOK) | m(DRAGON);
+        if rooks & BB.rook_reach[sq] != 0 {
+            for g in [0, 3, 4, 7] {
+                if let Some(s) = first_on_ray(occ, g, sq) {
+                    a |= rooks & (1u128 << s);
+                }
+            }
+        }
+        let bishops = m(BISHOP) | m(HORSE);
+        if bishops & BB.bishop_reach[sq] != 0 {
+            for g in [1, 2, 5, 6] {
+                if let Some(s) = first_on_ray(occ, g, sq) {
+                    a |= bishops & (1u128 << s);
+                }
+            }
+        }
+        let lances = m(LANCE);
+        let g = if by == BLACK { 7 } else { 0 };
+        if lances & BB.ray[g][sq] != 0 {
+            if let Some(s) = first_on_ray(occ, g, sq) {
+                a |= lances & (1u128 << s);
+            }
+        }
+        a
+    }
+
+    fn attacked_slow(&self, sq: usize, by: usize) -> bool {
         let opp = by ^ 1;
         for d in 0..10 {
             let a = NEIGHBOR[opp][sq][d];
@@ -286,6 +409,23 @@ impl Position {
     pub fn gives_check(&mut self, m: Move) -> bool {
         let king = self.king[self.side ^ 1];
         if king == NO_SQ { return false; }
+        if cfg!(feature = "v_bbchk") {
+            // 実験 速さ4 V21：盤を書き換えず、自分の駒の印の写しを、動いた駒の分だけ直して調べる（値は同じ）
+            let us = self.side;
+            let to = mv_to(m);
+            let mut b = self.bb[us];
+            let mut occ = self.occ | (1u128 << to);
+            if mv_is_drop(m) {
+                b[mv_drop_pt(m) as usize] |= 1u128 << to;
+            } else {
+                let from = mv_from(m);
+                let pt = type_of(self.board[from]) as usize;
+                b[pt] &= !(1u128 << from);
+                occ &= !(1u128 << from);
+                b[if mv_is_promo(m) { pt + PROMOTE as usize } else { pt }] |= 1u128 << to;
+            }
+            return Self::attacked_by_sets(&b, occ, king, us);
+        }
         let to = mv_to(m);
         let captured = self.board[to];
         let from = if mv_is_drop(m) { NO_SQ } else { mv_from(m) };
@@ -293,14 +433,14 @@ impl Position {
             make_piece(self.side, mv_drop_pt(m))
         } else {
             let pc = self.board[from];
-            self.board[from] = 0;
+            self.set_sq(from, 0);
             if mv_is_promo(m) { pc + PROMOTE } else { pc }
         };
-        self.board[to] = moving;
+        self.set_sq(to, moving);
         let result = self.attacked(king, self.side);
-        self.board[to] = captured;
+        self.set_sq(to, captured);
         if from != NO_SQ {
-            self.board[from] = if mv_is_promo(m) { moving - PROMOTE } else { moving };
+            self.set_sq(from, if mv_is_promo(m) { moving - PROMOTE } else { moving });
         }
         result
     }
@@ -314,12 +454,12 @@ impl Position {
         let to = mv_to(m);
         let pc = self.board[from];
         let moving = if mv_is_promo(m) { pc + PROMOTE } else { pc };
-        self.board[from] = 0;
-        self.board[to] = moving;
+        self.set_sq(from, 0);
+        self.set_sq(to, moving);
         let k = if from == self.king[us] { to } else { self.king[us] };
         let ok = k == NO_SQ || !self.attacked(k, us ^ 1);
-        self.board[to] = 0;
-        self.board[from] = pc;
+        self.set_sq(to, 0);
+        self.set_sq(from, pc);
         ok
     }
 
@@ -536,12 +676,12 @@ impl Position {
         let us = self.side;
         let pc = self.board[from];
         let cap = self.board[to];
-        self.board[from] = 0;
-        self.board[to] = pc;
+        self.set_sq(from, 0);
+        self.set_sq(to, pc);
         let k = if from == self.king[us] { to } else { self.king[us] };
         let ok = !self.attacked(k, us ^ 1);
-        self.board[to] = cap;
-        self.board[from] = pc;
+        self.set_sq(to, cap);
+        self.set_sq(from, pc);
         ok
     }
 
@@ -687,9 +827,143 @@ impl Position {
     /// Shogi exchange values include the captured piece returning to hand unpromoted.
     pub fn see_with_hand(&self, m: Move) -> i32 { self.see_impl(m, true) }
 
+    /// SEE が t 以上か（結果は `see_impl(m, with_hand) >= t` と同じ）。実験 速さ4 V14（cargo の機能 v_seefast）で使う。
+    /// 取り合いの値は「最初に取った分」以下で、「取った駒 − 動かした駒（成る前）」以上になるので、そこで決まるときは数えない
+    pub fn see_ge(&self, m: Move, t: i32, with_hand: bool) -> bool {
+        let values = if with_hand { &CAPTURE_VALUE } else { &SEE_BOARD_VALUE };
+        let (hi, lo) = if mv_is_drop(m) {
+            (0, -values[mv_drop_pt(m) as usize])
+        } else {
+            let p = self.board[mv_from(m)];
+            let moving = if mv_is_promo(m) { p + PROMOTE } else { p };
+            let v = values[type_of(self.board[mv_to(m)]) as usize];
+            (v + values[type_of(moving) as usize] - values[type_of(p) as usize], v - values[type_of(p) as usize])
+        };
+        if lo >= t {
+            return true;
+        }
+        if hi < t {
+            return false;
+        }
+        self.see_impl(m, with_hand) >= t
+    }
+
+    #[inline]
     fn see_impl(&self, m: Move, with_hand: bool) -> i32 {
-        const BOARD: [i32; 15] = [0, 90, 315, 405, 495, 855, 990, 540, 20000, 540, 540, 540, 540, 945, 1395];
-        let values = if with_hand { &CAPTURE_VALUE } else { &BOARD };
+        if cfg!(feature = "v_bbsee") {
+            self.see_impl_bb(m, with_hand)
+        } else if cfg!(feature = "v_seefast") {
+            self.see_impl_ray(m, with_hand)
+        } else {
+            self.see_impl_slow(m, with_hand)
+        }
+    }
+
+    /// 実験 速さ4 V18（cargo の機能 v_bbsee）：取り合いの升に利いている駒を印で一度に求め、安い順・同じなら方向の順に選ぶ。
+    /// 選ぶ駒（`least_attacker` と同じ）と結果は `see_impl_slow` と同じ
+    fn see_impl_bb(&self, m: Move, with_hand: bool) -> i32 {
+        use crate::bb::BB;
+        let values = if with_hand { &CAPTURE_VALUE } else { &SEE_BOARD_VALUE };
+        let order = if with_hand { &CAPTURE_VALUE } else { &LEAST_ATTACKER_ORDER };
+        let to = mv_to(m);
+        let mut occ = self.occ;
+        let mut gain = [0i32; 40];
+        let moving;
+        if mv_is_drop(m) {
+            moving = make_piece(self.side, mv_drop_pt(m));
+            gain[0] = 0;
+        } else {
+            let p = self.board[mv_from(m)];
+            moving = if mv_is_promo(m) { p + PROMOTE } else { p };
+            gain[0] = values[type_of(self.board[to]) as usize] + (values[type_of(moving) as usize] - values[type_of(p) as usize]);
+            occ &= !(1u128 << mv_from(m));
+        }
+        let mut on_square = values[type_of(moving) as usize];
+        let mut side = self.side ^ 1;
+        let mut d = 0;
+        while d < 38 {
+            let mut a = self.attackers_bb(to, side, occ);
+            if a == 0 {
+                break;
+            }
+            // 動いていない駒は元の升にいるので、駒の種類は self.board で分かる
+            let mut best = (i32::MAX, 255u8, 0usize);
+            while a != 0 {
+                let s = a.trailing_zeros() as usize;
+                a &= a - 1;
+                let key = (order[type_of(self.board[s]) as usize], BB.dir[side][to][s]);
+                if key < (best.0, best.1) {
+                    best = (key.0, key.1, s);
+                }
+            }
+            let sq = best.2;
+            d += 1;
+            gain[d] = on_square - gain[d - 1];
+            if (-gain[d - 1]).max(gain[d]) < 0 {
+                break;
+            }
+            on_square = values[type_of(self.board[sq]) as usize];
+            occ &= !(1u128 << sq);
+            side ^= 1;
+        }
+        while d > 0 {
+            gain[d - 1] = -((-gain[d - 1]).max(gain[d]));
+            d -= 1;
+        }
+        gain[0]
+    }
+
+    /// 実験 速さ4 V14：取り合いの升から見た8本の線の、いちばん近い駒の升を最初に1回だけ調べ、取った駒の後ろだけ調べ直す。
+    /// 取る駒の選び方（安い順、同じなら方向の順）と結果は `see_impl_slow` と同じ
+    fn see_impl_ray(&self, m: Move, with_hand: bool) -> i32 {
+        let values = if with_hand { &CAPTURE_VALUE } else { &SEE_BOARD_VALUE };
+        let order = if with_hand { &CAPTURE_VALUE } else { &LEAST_ATTACKER_ORDER };
+        let to = mv_to(m);
+        let mut board = self.board;
+        let mut gain = [0i32; 40];
+        let moving;
+        if mv_is_drop(m) {
+            moving = make_piece(self.side, mv_drop_pt(m));
+            gain[0] = 0;
+        } else {
+            let p = board[mv_from(m)];
+            moving = if mv_is_promo(m) { p + PROMOTE } else { p };
+            gain[0] = values[type_of(board[to]) as usize] + (values[type_of(moving) as usize] - values[type_of(p) as usize]);
+            board[mv_from(m)] = 0;
+        }
+        board[to] = moving;
+        // 線 g（先手の向きの方向 0〜7）ごとの、いちばん近い駒の升（なければ NO_SQ）
+        let mut first = [NO_SQ as u8; 8];
+        for g in 0..8 {
+            first[g] = ray_first(&board, to, g);
+        }
+        let mut on_square = values[type_of(moving) as usize];
+        let mut side = self.side ^ 1;
+        let mut d = 0;
+        while d < 38 {
+            let Some((sq, p, g)) = least_attacker_ray(&board, to, side, order, &first) else { break };
+            d += 1;
+            gain[d] = on_square - gain[d - 1];
+            if (-gain[d - 1]).max(gain[d]) < 0 {
+                break;
+            }
+            on_square = values[type_of(p) as usize];
+            board[sq] = 0;
+            board[to] = p;
+            side ^= 1;
+            if g < 8 {
+                first[g] = ray_first(&board, sq, g);
+            }
+        }
+        while d > 0 {
+            gain[d - 1] = -((-gain[d - 1]).max(gain[d]));
+            d -= 1;
+        }
+        gain[0]
+    }
+
+    fn see_impl_slow(&self, m: Move, with_hand: bool) -> i32 {
+        let values = if with_hand { &CAPTURE_VALUE } else { &SEE_BOARD_VALUE };
         let to = mv_to(m);
         let mut board = self.board;
         let mut gain = [0i32; 40];
@@ -765,13 +1039,29 @@ impl Position {
     #[inline(always)]
     fn gen_board_moves(&self, list: &mut MoveList, captures_only: bool) {
         let us = self.side;
+        if cfg!(feature = "v_bbgen") {
+            // 実験 速さ4 V19：自分の駒のある升だけを、升の番号の小さい順にたどる（順番は下と同じ）
+            let mut own = self.bb[us].iter().fold(0u128, |a, &b| a | b);
+            while own != 0 {
+                let from = own.trailing_zeros() as usize;
+                own &= own - 1;
+                self.gen_piece_moves(list, us, from, type_of(self.board[from]), captures_only);
+            }
+            return;
+        }
         for from in 0..81 {
             let p = self.board[from];
             if p == 0 || color_of(p) != us {
                 continue;
             }
-            let pt = type_of(p);
+            self.gen_piece_moves(list, us, from, type_of(p), captures_only);
+        }
+    }
 
+    /// 升 from の駒（手番 us、駒種 pt）を動かす疑似合法手
+    #[inline(always)]
+    fn gen_piece_moves(&self, list: &mut MoveList, us: usize, from: usize, pt: u8, captures_only: bool) {
+        {
             let mut mask = STEP_MASK[pt as usize];
             while mask != 0 {
                 let d = mask.trailing_zeros() as usize;
@@ -823,6 +1113,35 @@ impl Position {
     #[inline(always)]
     fn gen_drops(&self, list: &mut MoveList) {
         let us = self.side;
+        if cfg!(feature = "v_bbgen") {
+            // 実験 速さ4 V19：空いている升のうち打てる段の升だけを、升の番号の小さい順にたどる（順番は下と同じ）
+            use crate::bb::{ALL, DROP_OK, FILE};
+            let empty = !self.occ & ALL;
+            let mut pawn_files = 0u128;
+            if self.hand[us][PAWN as usize] > 0 {
+                let pawns = self.bb[us][PAWN as usize];
+                for f in 0..9 {
+                    if pawns & FILE[f] != 0 {
+                        pawn_files |= FILE[f];
+                    }
+                }
+            }
+            for pt in PAWN..=GOLD {
+                if self.hand[us][pt as usize] == 0 {
+                    continue;
+                }
+                let mut t = empty & DROP_OK[us][pt as usize];
+                if pt == PAWN {
+                    t &= !pawn_files;
+                }
+                while t != 0 {
+                    let to = t.trailing_zeros() as usize;
+                    t &= t - 1;
+                    list.push(make_drop(pt, to));
+                }
+            }
+            return;
+        }
         let mut pawn_files = 0u16;
         if self.hand[us][PAWN as usize] > 0 {
             let own_pawn = make_piece(us, PAWN);
@@ -1057,9 +1376,63 @@ impl Position {
 }
 
 /// 升 sq に利いている手番 by の駒のうち、いちばん安い駒（SEE 用）。駒の後ろの利き（X線）も盤から駒を除けば自然に反映される
+/// 升 sq から先手の向きの方向 g へ進んだとき、いちばん近い駒の升（なければ NO_SQ）
+#[inline]
+fn ray_first(board: &[u8; 81], sq: usize, g: usize) -> u8 {
+    let mut s = sq;
+    loop {
+        let n = NEIGHBOR[BLACK][s][g];
+        if n < 0 {
+            return NO_SQ as u8;
+        }
+        s = n as usize;
+        if board[s] != 0 {
+            return s as u8;
+        }
+    }
+}
+
+/// `least_attacker` と同じ駒を返す（線ごとのいちばん近い駒 first を使う）。3つ目は、その駒のいた線（桂は 8）
+#[inline]
+fn least_attacker_ray(board: &[u8; 81], sq: usize, by: usize, order: &[i32; 15], first: &[u8; 8]) -> Option<(usize, u8, usize)> {
+    let opp = by ^ 1;
+    let mut best: Option<(usize, u8, usize)> = None;
+    for d in 0..10 {
+        let (s, mask, g) = if d < 8 {
+            // NEIGHBOR[後手][升][d] は NEIGHBOR[先手][升][7 − d] と同じ升
+            let g = if opp == BLACK { d } else { 7 - d };
+            let s = first[g] as usize;
+            if s == NO_SQ {
+                continue;
+            }
+            let pt = type_of(board[s]) as usize;
+            let mask = if s as i8 == NEIGHBOR[opp][sq][d] { STEP_MASK[pt] | SLIDE_MASK[pt] } else { SLIDE_MASK[pt] };
+            (s, mask, g)
+        } else {
+            let a = NEIGHBOR[opp][sq][d];
+            if a < 0 || board[a as usize] == 0 {
+                continue;
+            }
+            let pt = type_of(board[a as usize]) as usize;
+            (a as usize, STEP_MASK[pt] | SLIDE_MASK[pt], 8)
+        };
+        let p = board[s];
+        if color_of(p) == by && mask & (1 << d) != 0
+            && best.map_or(true, |(_, b, _)| order[type_of(p) as usize] < order[type_of(b) as usize])
+        {
+            best = Some((s, p, g));
+        }
+    }
+    best
+}
+
+/// SEE の盤上の駒の値（持ち駒を数えないとき）
+const SEE_BOARD_VALUE: [i32; 15] = [0, 90, 315, 405, 495, 855, 990, 540, 20000, 540, 540, 540, 540, 945, 1395];
+/// SEE で取り返す駒を選ぶ順（持ち駒を数えないとき）
+const LEAST_ATTACKER_ORDER: [i32; 15] = [0, 1, 2, 3, 4, 7, 8, 5, 20, 5, 5, 5, 5, 9, 10];
+
 fn least_attacker(board: &[u8; 81], sq: usize, by: usize, with_hand: bool) -> Option<(usize, u8)> {
-    const ORDER: [i32; 15] = [0, 1, 2, 3, 4, 7, 8, 5, 20, 5, 5, 5, 5, 9, 10];
-    let order = if with_hand { &CAPTURE_VALUE } else { &ORDER };
+    let order = if with_hand { &CAPTURE_VALUE } else { &LEAST_ATTACKER_ORDER };
     let opp = by ^ 1;
     let mut best: Option<(usize, u8)> = None;
     let mut consider = |s: usize, p: u8, best: &mut Option<(usize, u8)>| {
@@ -1308,6 +1681,98 @@ mod tactical_tests {
     }
 }
 
+/// 実験 速さ4 V17：印が盤と合っていて、印による利きの判定が前の判定とすべての升で一致する
+#[cfg(all(test, feature = "v_bb"))]
+mod bb_tests {
+    use super::*;
+    #[test]
+    fn bitboards_follow_board_and_attacks_match() {
+        let mut rng = 246813579u64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        let mut pos = Position::startpos();
+        let mut ply = 0;
+        for _ in 0..6000 {
+            let mut fresh = pos.clone();
+            fresh.rebuild_bb();
+            assert!(fresh.bb == pos.bb && fresh.occ == pos.occ);
+            for sq in 0..81 {
+                for by in 0..2 {
+                    assert_eq!(pos.attacked_bb(sq, by), pos.attacked_slow(sq, by));
+                }
+            }
+            // 盤を一時的に書き換える判定の後も、印が元に戻っている
+            let mut list = MoveList::new();
+            pos.gen_moves(&mut list, false);
+            for &m in &list.moves[..list.len] {
+                for with_hand in [false, true] {
+                    assert_eq!(pos.see_impl_bb(m, with_hand), pos.see_impl_slow(m, with_hand), "{}", move_to_usi(m));
+                }
+                let _ = pos.gives_check(m);
+                if !pos.in_check() && !mv_is_drop(m) && pos.board[mv_to(m)] == 0 { let _ = pos.is_legal_quiet(m); }
+            }
+            let _ = pos.mate_in_one();
+            assert!(fresh.bb == pos.bb && fresh.occ == pos.occ);
+            // 印を使わない局面（bb が空）で作った手と、順番まで同じ
+            let mut plain = pos.clone();
+            plain.bb = [[0; 15]; 2];
+            plain.occ = 0;
+            let mut slow = MoveList::new();
+            for from in 0..81 {
+                let p = plain.board[from];
+                if p != 0 && color_of(p) == plain.side {
+                    plain.gen_piece_moves(&mut slow, plain.side, from, type_of(p), false);
+                }
+            }
+            let n_board = slow.len;
+            for cap in [false, true] {
+                let mut fast = MoveList::new();
+                pos.gen_moves(&mut fast, cap);
+                let mut want = MoveList::new();
+                for from in 0..81 {
+                    let p = plain.board[from];
+                    if p != 0 && color_of(p) == plain.side {
+                        plain.gen_piece_moves(&mut want, plain.side, from, type_of(p), cap);
+                    }
+                }
+                if !cap {
+                    let us = plain.side;
+                    let mut pawn_files = 0u16;
+                    let own_pawn = make_piece(us, PAWN);
+                    for f in 0..9 {
+                        if (0..9).any(|r| plain.board[f * 9 + r] == own_pawn) { pawn_files |= 1 << f; }
+                    }
+                    for pt in PAWN..=GOLD {
+                        if plain.hand[us][pt as usize] == 0 { continue; }
+                        for to in 0..81 {
+                            if plain.board[to] != 0 { continue; }
+                            let rr = rel_rank(us, to % 9);
+                            let ok = match pt { PAWN => rr != 0 && pawn_files & (1 << (to / 9)) == 0, LANCE => rr != 0, KNIGHT => rr > 1, _ => true };
+                            if ok { want.push(make_drop(pt, to)); }
+                        }
+                    }
+                }
+                assert_eq!(&fast.moves[..fast.len], &want.moves[..want.len]);
+            }
+            assert!(n_board <= list.len);
+            let legal = pos.legal_moves();
+            if legal.is_empty() || ply > 250 {
+                pos = Position::startpos();
+                ply = 0;
+                continue;
+            }
+            let caps: Vec<Move> = legal.iter().copied().filter(|&m| !mv_is_drop(m) && pos.board[mv_to(m)] != 0).collect();
+            let m = if !caps.is_empty() && next(3) != 0 { caps[next(caps.len())] } else { legal[next(legal.len())] };
+            pos.do_move(m);
+            ply += 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod exchange_tests {
     use super::*;
@@ -1327,6 +1792,50 @@ mod exchange_tests {
         let m = p.parse_usi_move("5d5c").unwrap();
         assert_eq!(p.see(m), 0);
         assert_eq!(p.see_with_hand(m), -500);
+    }
+
+    /// 実験 速さ4 V14：線を使い回す SEE と見積もりで決める see_ge が、前の SEE とすべての手で一致する
+    #[test]
+    fn fast_see_matches_slow() {
+        for sq in 0..81 {
+            for d in 0..8 {
+                assert_eq!(NEIGHBOR[WHITE][sq][d], NEIGHBOR[BLACK][sq][7 - d]);
+            }
+        }
+        let mut rng = 1122334455u64;
+        let mut next = |n: usize| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            (rng % n as u64) as usize
+        };
+        let mut pos = Position::startpos();
+        let (mut checked, mut exchanges) = (0, 0);
+        for _ in 0..4000 {
+            let mut list = MoveList::new();
+            pos.gen_moves(&mut list, false);
+            for &m in &list.moves[..list.len] {
+                for with_hand in [false, true] {
+                    let slow = pos.see_impl_slow(m, with_hand);
+                    assert_eq!(pos.see_impl_ray(m, with_hand), slow, "{} 手目 {}", pos.history.len(), move_to_usi(m));
+                    for t in [-2000, -500, -218, -42, -1, 0, 1, 100, 500] {
+                        assert_eq!(pos.see_ge(m, t, with_hand), slow >= t);
+                    }
+                    checked += 1;
+                    if slow != 0 && pos.board[mv_to(m)] != 0 { exchanges += 1; }
+                }
+            }
+            let legal = pos.legal_moves();
+            if legal.is_empty() || pos.history.len() > 300 {
+                pos = Position::startpos();
+                continue;
+            }
+            // 取り合いが起きやすいよう、取る手を選びやすくする
+            let caps: Vec<Move> = legal.iter().copied().filter(|&m| !mv_is_drop(m) && pos.board[mv_to(m)] != 0).collect();
+            let m = if !caps.is_empty() && next(3) != 0 { caps[next(caps.len())] } else { legal[next(legal.len())] };
+            pos.do_move(m);
+        }
+        assert!(checked > 100_000 && exchanges > 10_000, "{} {}", checked, exchanges);
     }
 }
 
