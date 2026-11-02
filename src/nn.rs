@@ -928,9 +928,12 @@ fn set_global(net: Network) {
 }
 
 /// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn）。
-/// cargo の機能 net_b4 なら実験B4（20エポック）の、net_b5 なら実験B5（水匠10 のデータを追加）のネットを埋め込む。
-#[cfg(not(any(feature = "net_b4", feature = "net_b5")))]
+/// cargo の機能 net_b4 なら実験B4（20エポック）の、net_b5 なら実験B5（水匠10 のデータを追加）の、
+/// net_nh なら実験NH（土台を駒の損得だけにして、手作りの評価を使わない）のネットを埋め込む。
+#[cfg(not(any(feature = "net_b4", feature = "net_b5", feature = "net_nh")))]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/default.nn");
+#[cfg(all(feature = "net_nh", not(any(feature = "net_b4", feature = "net_b5"))))]
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/nh.nn");
 #[cfg(feature = "net_b4")]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/b4.nn");
 #[cfg(all(feature = "net_b5", not(feature = "net_b4")))]

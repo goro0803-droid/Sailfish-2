@@ -52,6 +52,8 @@ time_bank = []
 net_b4 = []
 # 実験B5：水匠10 の教師データを加えて学習したネット（nets/b5.nn）を埋め込む
 net_b5 = []
+# 実験NH（11/1）：土台を駒の損得だけにして学習したネット（nets/nh.nn）を埋め込む（手作りの評価を使わない）
+net_nh = []
 # 診断 diagSE：ExtEvalFile でやねうら王形式の NNUE（HalfKP 256x2-32-32）を読み、評価をまるごと置き換える。
 # NodesLimit（go に nodes を付けたのと同じ）と、デバッグ用の exteval コマンドも名乗る。探索と評価の差の切り分けだけに使う
 ext_eval = []
