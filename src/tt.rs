@@ -25,8 +25,8 @@ impl TTEntry {
 
     #[inline]
     fn unpack(d: u64) -> TTEntry {
-        // 診断 tt_stats では flag の上の6ビットに世代を入れるので、下の2ビットだけを flag とする
-        let flag = if cfg!(feature = "tt_stats") { (d >> 56) as u8 & 3 } else { (d >> 56) as u8 };
+        // 診断 tt_stats・段階2 t_bucket では flag の上の6ビットに世代を入れるので、下の2ビットだけを flag とする
+        let flag = if GEN_ON { (d >> 56) as u8 & 3 } else { (d >> 56) as u8 };
         TTEntry { mv: d as u32, score: (d >> 32) as u16 as i16, depth: (d >> 48) as u8 as i8, flag }
     }
 }
@@ -51,6 +51,9 @@ fn tsc(i: usize) {
 pub fn tt_stats_take() -> Vec<u64> {
     TS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect()
 }
+
+/// 世代（何回目の思考か）を置換表に入れるか（診断 tt_stats と、段階2 の t_bucket）
+const GEN_ON: bool = cfg!(feature = "tt_stats") || cfg!(feature = "t_bucket");
 
 #[derive(Default)]
 struct Slot {
@@ -78,17 +81,17 @@ impl TT {
         TT { table, mask: size - 1, size_mb, generation: AtomicU8::new(0) }
     }
 
-    /// 思考の初めに呼ぶ（診断 tt_stats のときだけ世代を進める）
+    /// 思考の初めに呼ぶ（診断 tt_stats・段階2 t_bucket のときだけ世代を進める）
     pub fn new_search(&self) {
-        if cfg!(feature = "tt_stats") {
+        if GEN_ON {
             self.generation.store(self.generation.load(Ordering::Relaxed).wrapping_add(1) & 63, Ordering::Relaxed);
         }
     }
 
-    /// 診断 tt_stats：書き込む値に世代を入れる
+    /// 診断 tt_stats・段階2 t_bucket：書き込む値に世代を入れる
     #[inline]
     fn with_gen(&self, data: u64) -> u64 {
-        if cfg!(feature = "tt_stats") { data | (self.generation.load(Ordering::Relaxed) as u64) << 58 } else { data }
+        if GEN_ON { data | (self.generation.load(Ordering::Relaxed) as u64) << 58 } else { data }
     }
 
     /// 診断 tt_stats：別の局面（または空き）に書くときの内訳を数える
@@ -118,6 +121,27 @@ impl TT {
         }
     }
 
+    /// 段階2 T1（cargo の機能 t_bucket）：隣り合う2か所を1組にする。key の局面がある方、なければ消す方を選ぶ。
+    /// 消すのは、空き → 前の思考の結果 → 浅い結果 の順（同じなら1か所目）。機能が無効なら今までどおり1か所だけ
+    #[inline]
+    fn slot_for(&self, key: u64) -> &Slot {
+        let i = key as usize & self.mask;
+        if !cfg!(feature = "t_bucket") {
+            return &self.table[i];
+        }
+        let (a, b) = (&self.table[i & !1], &self.table[i | 1]);
+        let (da, db) = (a.data.load(Ordering::Relaxed), b.data.load(Ordering::Relaxed));
+        if a.key_xor.load(Ordering::Relaxed) ^ da == key { return a; }
+        if b.key_xor.load(Ordering::Relaxed) ^ db == key { return b; }
+        let g = self.generation.load(Ordering::Relaxed);
+        let worth = |d: u64| -> i32 {
+            let e = TTEntry::unpack(d);
+            if e.flag == 0 { return -1000; }
+            e.depth as i32 - if (d >> 58) as u8 != g { 200 } else { 0 }
+        };
+        if worth(db) < worth(da) { b } else { a }
+    }
+
     pub fn clear(&self) {
         for s in &self.table {
             s.key_xor.store(0, Ordering::Relaxed);
@@ -127,7 +151,7 @@ impl TT {
 
     #[inline]
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let s = &self.table[key as usize & self.mask];
+        let s = self.slot_for(key);
         let data = s.data.load(Ordering::Relaxed);
         tsc(0);
         if s.key_xor.load(Ordering::Relaxed) ^ data == key {
@@ -142,7 +166,7 @@ impl TT {
 
     #[inline]
     pub fn store(&self, key: u64, mv: Move, score: i32, depth: i32, flag: u8) {
-        let s = &self.table[key as usize & self.mask];
+        let s = self.slot_for(key);
         let old_data = s.data.load(Ordering::Relaxed);
         let same = s.key_xor.load(Ordering::Relaxed) ^ old_data == key;
         let old = TTEntry::unpack(old_data);
@@ -162,7 +186,7 @@ impl TT {
     /// 静止探索の結果を保存する。同じ局面の通常探索の結果（深さ 1 以上）は上書きしない。
     #[inline]
     pub fn store_qs(&self, key: u64, mv: Move, score: i32, flag: u8) {
-        let s = &self.table[key as usize & self.mask];
+        let s = self.slot_for(key);
         let old_data = s.data.load(Ordering::Relaxed);
         let same = s.key_xor.load(Ordering::Relaxed) ^ old_data == key;
         let old = TTEntry::unpack(old_data);
