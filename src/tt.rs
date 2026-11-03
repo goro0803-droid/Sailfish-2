@@ -3,7 +3,7 @@
 //! 書き込みの途中を読んでしまっても壊れた値を使わないよう、キーとデータの XOR を保存して照合する。
 
 use crate::types::Move;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 pub const BOUND_UPPER: u8 = 1;
 pub const BOUND_LOWER: u8 = 2;
@@ -25,8 +25,31 @@ impl TTEntry {
 
     #[inline]
     fn unpack(d: u64) -> TTEntry {
-        TTEntry { mv: d as u32, score: (d >> 32) as u16 as i16, depth: (d >> 48) as u8 as i8, flag: (d >> 56) as u8 }
+        // 診断 tt_stats では flag の上の6ビットに世代を入れるので、下の2ビットだけを flag とする
+        let flag = if cfg!(feature = "tt_stats") { (d >> 56) as u8 & 3 } else { (d >> 56) as u8 };
+        TTEntry { mv: d as u32, score: (d >> 32) as u16 as i16, depth: (d >> 48) as u8 as i8, flag }
     }
+}
+
+/// 診断（cargo の機能 tt_stats）：置換表の読み書きを全スレッドの合計で数える。添字は TS_NAMES の順
+pub const TS_NAMES: [&str; 22] = [
+    "probe", "hit", "store", "same_write", "same_skip", "empty", "replace",
+    "rep_old_qs", "rep_old_1_3", "rep_old_4_7", "rep_old_8",
+    "rep_prev_gen", "rep_deeper", "rep_deeper_cur4",
+    "qs_store", "qs_same_skip", "qs_same_write", "qs_empty", "qs_replace", "qs_rep_main", "qs_rep_main_cur4", "qs_rep_prev_gen",
+];
+static TS: [AtomicU64; 22] = [const { AtomicU64::new(0) }; 22];
+
+#[inline]
+fn tsc(i: usize) {
+    if cfg!(feature = "tt_stats") {
+        TS[i].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 診断 tt_stats：数を読み出して 0 に戻す
+pub fn tt_stats_take() -> Vec<u64> {
+    TS.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect()
 }
 
 #[derive(Default)]
@@ -39,6 +62,8 @@ pub struct TT {
     table: Vec<Slot>,
     mask: usize,
     pub size_mb: usize,
+    /// 診断 tt_stats：何回目の思考か（下の6ビット）
+    generation: AtomicU8,
 }
 
 impl TT {
@@ -50,7 +75,47 @@ impl TT {
         }
         let mut table = Vec::with_capacity(size);
         table.resize_with(size, Slot::default);
-        TT { table, mask: size - 1, size_mb }
+        TT { table, mask: size - 1, size_mb, generation: AtomicU8::new(0) }
+    }
+
+    /// 思考の初めに呼ぶ（診断 tt_stats のときだけ世代を進める）
+    pub fn new_search(&self) {
+        if cfg!(feature = "tt_stats") {
+            self.generation.store(self.generation.load(Ordering::Relaxed).wrapping_add(1) & 63, Ordering::Relaxed);
+        }
+    }
+
+    /// 診断 tt_stats：書き込む値に世代を入れる
+    #[inline]
+    fn with_gen(&self, data: u64) -> u64 {
+        if cfg!(feature = "tt_stats") { data | (self.generation.load(Ordering::Relaxed) as u64) << 58 } else { data }
+    }
+
+    /// 診断 tt_stats：別の局面（または空き）に書くときの内訳を数える
+    #[inline]
+    fn count_replace(&self, old_data: u64, new_depth: i32, qs: bool) {
+        if !cfg!(feature = "tt_stats") {
+            return;
+        }
+        let old = TTEntry::unpack(old_data);
+        if old.flag == 0 {
+            tsc(if qs { 17 } else { 5 });
+            return;
+        }
+        let cur = (old_data >> 58) as u8 == self.generation.load(Ordering::Relaxed);
+        let d = old.depth as i32;
+        if qs {
+            tsc(18);
+            if d >= 1 { tsc(19); }
+            if cur && d >= 4 { tsc(20); }
+            if !cur { tsc(21); }
+        } else {
+            tsc(6);
+            tsc(if d <= 0 { 7 } else if d <= 3 { 8 } else if d <= 7 { 9 } else { 10 });
+            if !cur { tsc(11); }
+            if d > new_depth { tsc(12); }
+            if cur && d >= 4 && d > new_depth { tsc(13); }
+        }
     }
 
     pub fn clear(&self) {
@@ -64,9 +129,11 @@ impl TT {
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
         let s = &self.table[key as usize & self.mask];
         let data = s.data.load(Ordering::Relaxed);
+        tsc(0);
         if s.key_xor.load(Ordering::Relaxed) ^ data == key {
             let e = TTEntry::unpack(data);
             if e.flag != 0 {
+                tsc(1);
                 return Some(e);
             }
         }
@@ -79,12 +146,16 @@ impl TT {
         let old_data = s.data.load(Ordering::Relaxed);
         let same = s.key_xor.load(Ordering::Relaxed) ^ old_data == key;
         let old = TTEntry::unpack(old_data);
+        tsc(2);
         if !same || flag == BOUND_EXACT || depth >= old.depth as i32 - 2 {
+            if same { tsc(3); } else { self.count_replace(old_data, depth, false); }
             let mv = if mv == 0 && same { old.mv } else { mv };
             let e = TTEntry { mv, score: score as i16, depth: depth.clamp(-1, 127) as i8, flag };
-            let data = e.pack();
+            let data = self.with_gen(e.pack());
             s.data.store(data, Ordering::Relaxed);
             s.key_xor.store(key ^ data, Ordering::Relaxed);
+        } else {
+            tsc(4);
         }
     }
 
@@ -95,12 +166,15 @@ impl TT {
         let old_data = s.data.load(Ordering::Relaxed);
         let same = s.key_xor.load(Ordering::Relaxed) ^ old_data == key;
         let old = TTEntry::unpack(old_data);
+        tsc(14);
         if same && old.depth > 0 {
+            tsc(15);
             return;
         }
+        if same { tsc(16); } else { self.count_replace(old_data, 0, true); }
         let mv = if mv == 0 && same { old.mv } else { mv };
         let e = TTEntry { mv, score: score as i16, depth: 0, flag };
-        let data = e.pack();
+        let data = self.with_gen(e.pack());
         s.data.store(data, Ordering::Relaxed);
         s.key_xor.store(key ^ data, Ordering::Relaxed);
     }

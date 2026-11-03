@@ -21,7 +21,8 @@ panic = "abort"
 # 10/30 から s_prune2（実験S6 の軽い枝刈り）も既定（実験S13：singular の入った 3.0 の上で、AobaNNUE 相手 1,200局で +4.1ポイント）。
 # 10/31 から v_prelmp（実験 速さ2 の V11：LMP・futility を指す前に判定。読みは同じで約4.5%速い）も既定。
 # 11/1 から h_keep（実験 速さ3 の H1）と、ビットボードの v_bb・v_bbsee・v_bbgen（実験 速さ4 の V17〜V19。読みは同じで約1.18倍）も既定。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen"]
+# 11/3 から h_bonus2（段階3：静かな手のヒストリーの加点を 150×深さ−100、上限1500 に。AobaNNUE 相手 800局で +4.0ポイント）も既定。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "h_bonus2"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -117,8 +118,20 @@ v_bbgen = ["v_bb"]
 v_bbeval = ["v_bb"]
 # V21：指す前の王手の判定を、盤を書き換えずに印の写しで行う（値は同じ）
 v_bbchk = ["v_bb"]
+# 実験 段階1（11/3）：V22 駒取りの SEE を選ぶときに調べ、分かった結果を静止探索・枝刈り・王手の延長で使い回す（選ぶ手と結果は同じ）
+v_seelazy = []
+# 実験 段階1（11/3）：V23 手作りの評価の利きを印の OR で求め、利きの数は玉の周りだけ数える（値は同じ）
+v_evalzone = ["v_bb"]
+# 段階3（11/3）：駒打ちの並べ方。O1 相手の銀以上の駒をねらう駒打ちに +1000、O2 は王手の駒打ちにも +1000
+o_dropthr = []
+o_dropchk = []
+# 段階3（11/3）：静かな手のヒストリーの加点。H1 16×深さ²（上限1600）、H2 150×深さ−100（上限1500）。今は 深さ²（上限400）
+h_bonus1 = []
+h_bonus2 = []
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []
 # 診断：読みの木の形（局面数の内訳、カットの様子、読み直しの数）を数え、思考の終わりに info string tree で出す（主スレッドの分だけ）
 tree_stats = []
+# 段階0（11/3）：置換表の読み書き（上書きの内訳・世代）を全スレッドの合計で数え、思考の終わりに info string ttstat で出す
+tt_stats = []

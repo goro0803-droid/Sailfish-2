@@ -182,7 +182,9 @@ fn king_danger(pos: &Position, c: usize, att: impl Fn(usize, usize) -> i32) -> i
 
 /// 手番側から見た評価値
 pub fn evaluate(pos: &Position) -> i32 {
-    let score = if cfg!(feature = "v_bbeval") {
+    let score = if cfg!(feature = "v_evalzone") {
+        eval_zone(pos)
+    } else if cfg!(feature = "v_bbeval") {
         eval_bb(pos)
     } else if cfg!(feature = "v_evalfast") {
         eval_fast(pos)
@@ -371,6 +373,100 @@ fn eval_bb(pos: &Position) -> [i32; 2] {
     score
 }
 
+/// 実験 段階1 V23（cargo の機能 v_evalzone）：利きを駒ごとの印で求め、利きがあるかは印の OR で、
+/// 利きの数は玉の危険度に使う玉の周り（両方の玉の、周りの8升と玉の升）だけで数える。値は `eval_impl::<true>` と同じ
+fn eval_zone(pos: &Position) -> [i32; 2] {
+    use crate::bb::{ray_attack, BB};
+    let t = tables();
+    let occ = pos.occ;
+    let mut zone = 0u128;
+    for c in 0..2 {
+        let k = pos.king[c];
+        if k == NO_SQ {
+            continue;
+        }
+        zone |= 1u128 << k;
+        for d in 0..8 {
+            let s = NEIGHBOR[c][k][d];
+            if s >= 0 {
+                zone |= 1u128 << s;
+            }
+        }
+    }
+    let mut any = [0u128; 2];
+    let mut cnt = [[0u8; 81]; 2];
+    let mut mobility = [0i32; 2];
+    for c in 0..2 {
+        for pt in 1..15 {
+            let mut set = pos.bb[c][pt];
+            while set != 0 {
+                let sq = set.trailing_zeros() as usize;
+                set &= set - 1;
+                let mut a = BB.step_att[c][pt][sq];
+                let mut mask = SLIDE_MASK[pt];
+                while mask != 0 {
+                    let d = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    let g = if c == BLACK { d } else { 7 - d };
+                    let r = ray_attack(occ, g, sq);
+                    if pt != LANCE as usize {
+                        mobility[c] += r.count_ones() as i32;
+                    }
+                    a |= r;
+                }
+                any[c] |= a;
+                let mut z = a & zone;
+                while z != 0 {
+                    let s = z.trailing_zeros() as usize;
+                    z &= z - 1;
+                    cnt[c][s] += 1;
+                }
+            }
+        }
+    }
+
+    let mut score = [0i32; 2];
+    let mut rest = occ;
+    while rest != 0 {
+        let sq = rest.trailing_zeros() as usize;
+        rest &= rest - 1;
+        let p = pos.board[sq];
+        let c = color_of(p);
+        let pt = type_of(p);
+        score[c] += PST[pt as usize][if c == BLACK { sq } else { 80 - sq }] as i32;
+        if pt == KING {
+            score[c] += KING_RANK[rel_rank(c, sq % 9)];
+            continue;
+        }
+        score[c] += PIECE_VALUE[pt as usize];
+        let ek = pos.king[c ^ 1];
+        if ek != NO_SQ {
+            let b = ATTACK_BONUS[t.dist[sq][ek] as usize];
+            score[c] += match pt {
+                PAWN | BISHOP | ROOK => b / 2,
+                _ => b,
+            };
+        }
+        let ok = pos.king[c];
+        if ok != NO_SQ && matches!(pt, GOLD | SILVER | PRO_PAWN | PRO_LANCE | PRO_KNIGHT | PRO_SILVER) {
+            score[c] += DEFEND_BONUS[t.dist[sq][ok] as usize];
+        }
+        if (any[c ^ 1] >> sq) & 1 != 0 && (any[c] >> sq) & 1 == 0 {
+            score[c] -= PIECE_VALUE[pt as usize] / 16;
+        }
+    }
+    let kd = KING_DANGER_PCT.load(Ordering::Relaxed);
+    let mw = MOBILITY_WEIGHT.load(Ordering::Relaxed);
+    for c in 0..2 {
+        for pt in 1..8 {
+            score[c] += HAND_VALUE[pt] * pos.hand[c][pt] as i32;
+        }
+        score[c] += mobility[c] * mw;
+        score[c] -= king_danger(pos, c, |c, s| cnt[c][s] as i32) * kd / 100;
+    }
+    score
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +481,7 @@ mod tests {
             assert_eq!(eval_fast(&pos), eval_impl::<true>(&pos), "{} 局面目", i);
             if cfg!(feature = "v_bb") {
                 assert_eq!(eval_bb(&pos), eval_impl::<true>(&pos), "{} 局面目", i);
+                assert_eq!(eval_zone(&pos), eval_impl::<true>(&pos), "{} 局面目", i);
             }
             let legal = pos.legal_moves();
             if legal.is_empty() || ply > 250 {

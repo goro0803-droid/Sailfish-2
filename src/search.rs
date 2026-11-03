@@ -104,6 +104,36 @@ fn threatens_enemy_piece(pos: &Position, sq: usize) -> bool {
     false
 }
 
+/// 段階3（o_dropthr・o_dropchk）：手番 c が升 sq に駒 pt を打ったとき、相手の玉に王手になるか、相手の銀以上の駒をねらうか
+/// （threatens_enemy_piece と同じ見方。打つ前の局面で調べる）
+fn drop_attacks(pos: &Position, c: usize, pt: usize, sq: usize) -> (bool, bool) {
+    let (step, slide) = (STEP_MASK[pt], SLIDE_MASK[pt]);
+    let (mut check, mut threat) = (false, false);
+    for d in 0..10 {
+        if (step | slide) & (1 << d) == 0 { continue; }
+        let mut s = sq;
+        loop {
+            let n = NEIGHBOR[c][s][d];
+            if n < 0 { break; }
+            s = n as usize;
+            let q = pos.board[s];
+            if q != 0 {
+                if color_of(q) != c {
+                    let qt = type_of(q);
+                    if qt == KING { check = true; }
+                    else if PIECE_VALUE[qt as usize] >= PIECE_VALUE[SILVER as usize] { threat = true; }
+                }
+                break;
+            }
+            if d >= 8 || slide & (1 << d) == 0 { break; }
+        }
+    }
+    (check, threat)
+}
+
+/// 段階3：駒打ちの並べ方で、王手・駒をねらう打ちに足す点数
+const DROP_BONUS: i32 = 1000;
+
 /// 実験SPSA（cargo の機能 tune）：探索の値。USI の隠しオプション T_0〜T_15 で変える。機能が無効なら既定の値を使う。
 /// 0 RFP の幅／1 RFP の深さの上限／2 futility の基本の幅／3 futility の幅（1手あたり）／4 futility の深さの上限／
 /// 5 LMP の基本の手数／6 LMP の手数（深さ²あたり）／7 LMP の深さの上限／8 ヌルムーブで減らす基本／9 ヌルムーブの深さの割り算／
@@ -430,6 +460,20 @@ struct TreeStats {
     d_cut: [u64; 24],
     d_cut_first: [u64; 24],
     d_cut_moves: [u64; 24],
+    /// 段階0：β カットした手の種類（0 置換表の手・1 得な駒取り・2 損な駒取り・3 成り・4 キラー・5 カウンター・6 盤上の静かな手・7 駒打ち）
+    /// ごとの回数と、カットまでに試した手（省いた手も含む）の合計
+    cut_kind: [u64; 8],
+    cut_kind_moves: [u64; 8],
+    /// 段階0：静かな手でカットした局面で、その前に試して失敗した静かな手（盤上の手・駒打ち）の合計
+    cut_qfail_board: u64,
+    cut_qfail_drop: u64,
+    /// 段階0：LMR で、ヒストリーが tp(12) を超えて減らし量を1減らした回数
+    lmr_hist: u64,
+    /// 段階3：試した駒打ち（置換表の手・キラー・カウンターを除く）と、カットした駒打ちを、
+    /// 0 王手／1 相手の玉の2升以内／2 相手の銀以上の駒をねらう／3 その他 に分けた数と、カットまでの手の数の合計
+    drop_tried: [u64; 4],
+    drop_cut: [u64; 4],
+    drop_cut_moves: [u64; 4],
 }
 
 /// tree_stats のときだけ、残りの深さ d の欄に数を足す
@@ -447,6 +491,9 @@ macro_rules! tsd {
 }
 /// (駒, 行き先) の数（ヒストリーの添字の大きさ）
 const PT: usize = 32 * 81;
+/// 実験 段階1 V22（v_seelazy）：得な駒取りの点数（200000＋base、base はおよそ −1100〜25000）の帯。ほかの種類の手の点数とは重ならない
+const LAZY_LO: i32 = 160_000;
+const LAZY_HI: i32 = 400_000;
 
 /// ヒストリーの値を、上限 16384 に向かって縮めながら b だけ動かす
 #[inline]
@@ -811,6 +858,7 @@ impl Searcher {
         }
         self.cont.iter_mut().for_each(|h| *h /= 2);
         self.caph.iter_mut().for_each(|h| *h /= 2);
+        self.tt.new_search();
 
         let root_moves = pos.legal_moves();
         self.prepare_goal_moves(pos, &root_moves);
@@ -886,6 +934,23 @@ impl Searcher {
             println!("info string treed main {} tt_cut {} rfp {} null_cut {} moves {} lmr {} red {} ext {} all {} all_moves {} all_pruned {} all_searched {} cut {} cut_first {} cut_moves {}",
                 j(&t.d_main), j(&t.d_tt_cut), j(&t.d_rfp), j(&t.d_null_cut), j(&t.d_moves), j(&t.d_lmr), j(&t.d_red), j(&t.d_ext),
                 j(&t.d_all), j(&t.d_all_moves), j(&t.d_all_pruned), j(&t.d_all_searched), j(&t.d_cut), j(&t.d_cut_first), j(&t.d_cut_moves));
+            // 段階0：カットした手の種類、ヒストリーの表の値の分布（0、正負それぞれ 1〜399・400〜3999・4000 以上）と最大値
+            let j8 = |a: &[u64]| a.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",");
+            let mut hb = [0u64; 7];
+            for &v in self.history.iter() {
+                let a = v.abs();
+                let k = if a == 0 { 0 } else if a < 400 { 1 } else if a < 4000 { 2 } else { 3 };
+                hb[if k == 0 { 0 } else if v > 0 { k } else { k + 3 }] += 1;
+            }
+            let hmax = self.history.iter().copied().max().unwrap_or(0);
+            println!("info string treek cut_kind {} cut_kind_moves {} cut_qfail_board {} cut_qfail_drop {} lmr_hist {} drop_tried {} drop_cut {} drop_cut_moves {} hist {} hist_max {}",
+                j8(&t.cut_kind), j8(&t.cut_kind_moves), t.cut_qfail_board, t.cut_qfail_drop, t.lmr_hist,
+                j8(&t.drop_tried), j8(&t.drop_cut), j8(&t.drop_cut_moves),
+                hb.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","), hmax);
+        }
+        if cfg!(feature = "tt_stats") {
+            let v = tt_stats_take();
+            println!("info string ttstat {}", TS_NAMES.iter().zip(v.iter()).map(|(n, x)| format!("{} {}", n, x)).collect::<Vec<_>>().join(" "));
         }
         if cfg!(feature = "corrhist") {
             let (raw, cor, n) = std::mem::take(&mut self.corr_stats);
@@ -1133,6 +1198,11 @@ impl Searcher {
                     self.caph[idx * 16 + type_of(pos.board[mv_to(m)]) as usize] as i32 / 16
                 } else { -attacker / 16 };
                 let base = victim * 16 + tiebreak + if mv_is_promo(m) { 1000 } else { 0 };
+                // 実験 段階1 V22（cargo の機能 v_seelazy）：SEE はまだ調べず、得な駒取りとして並べる（選ぶときに pick_lazy が調べる）
+                if cfg!(feature = "v_seelazy") {
+                    scores[i] = 200_000 + base;
+                    continue;
+                }
                 // 取り合いで損をする駒取りは、静かな手より後ろに回す
                 let hand = self.feat & (F_SEE_HAND | F_SEE_HAND_ORDER) != 0;
                 let see_ok = if cfg!(feature = "v_seefast") {
@@ -1156,7 +1226,12 @@ impl Searcher {
                 } else {
                     pos.board[mv_from(m)]
                 };
-                self.quiet_stat(piece, mv_to(m), ply)
+                let s = self.quiet_stat(piece, mv_to(m), ply);
+                // 段階3 O1（o_dropthr）：相手の銀以上の駒をねらう駒打ちを前へ／O2（o_dropchk）：王手の駒打ちも
+                if (cfg!(feature = "o_dropthr") || cfg!(feature = "o_dropchk")) && mv_is_drop(m) {
+                    let (check, threat) = drop_attacks(pos, pos.side, mv_drop_pt(m) as usize, mv_to(m));
+                    if threat || (cfg!(feature = "o_dropchk") && check) { s + DROP_BONUS } else { s }
+                } else { s }
             };
         }
     }
@@ -1170,6 +1245,46 @@ impl Searcher {
         list.moves.swap(i, best);
         scores.swap(i, best);
         list.moves[i]
+    }
+
+    /// 実験 段階1 V22（v_seelazy）：pick_move と同じ手を選ぶが、駒取りの SEE は選ぶときに調べる。
+    /// 残りの手のうち得な駒取りの点数帯（LAZY_LO〜LAZY_HI）にあるのは、まだ SEE を調べていない駒取りだけ
+    /// （調べて得なら、その場で選ばれて残りから外れる）。損なら order_moves と同じ −60000＋base に下げて選び直す。
+    /// 先に調べた手より前に同じ点数の手は無いので、選ぶ手と並びは SEE を先に調べたときと同じ
+    #[inline]
+    fn pick_lazy(&self, pos: &Position, list: &mut MoveList, scores: &mut [i32], i: usize) -> Move {
+        loop {
+            let rest = &scores[i..list.len];
+            let max = rest.iter().copied().fold(i32::MIN, i32::max);
+            let best = i + rest.iter().position(|&s| s == max).unwrap_or(0);
+            if (LAZY_LO..LAZY_HI).contains(&max) {
+                let m = list.moves[best];
+                let hand = self.feat & (F_SEE_HAND | F_SEE_HAND_ORDER) != 0;
+                let see_ok = prof!(self, 6, if cfg!(feature = "v_seefast") {
+                    pos.see_ge(m, 0, hand)
+                } else if hand { pos.see_with_hand(m) >= 0 } else { pos.see(m) >= 0 });
+                if !see_ok {
+                    scores[best] = max - 260_000;
+                    continue;
+                }
+            }
+            list.moves.swap(i, best);
+            scores.swap(i, best);
+            return list.moves[i];
+        }
+    }
+
+    /// 実験 段階1 V22（v_seelazy）：選んだ駒取り（置換表の手を除く）の点数から、SEE ≥ 0 が分かっていればそれを返す。
+    /// 並べるときと読むときで持ち駒の扱いが違う設定では使わない
+    #[inline]
+    fn known_see_ok(&self, is_cap: bool, m: Move, tt_move: Move, score: i32) -> Option<bool> {
+        if cfg!(feature = "v_seelazy") && is_cap && m != tt_move
+            && (self.feat & F_SEE_HAND_ORDER == 0 || self.feat & F_SEE_HAND != 0)
+        {
+            Some(score >= 0)
+        } else {
+            None
+        }
     }
 
     fn negamax(&mut self, pos: &mut Position, alpha: i32, beta: i32,
@@ -1484,6 +1599,11 @@ impl Searcher {
         let mut pruned = 0;
         // tree_stats：実際に読んだ手の数（LMP・futility で省いた手を除く）
         let mut ts_searched = 0;
+        // 段階0（tree_stats）：試した静かな手のうちの駒打ちの数
+        let mut ts_qdrops = 0;
+        // 段階3（tree_stats）：いま読んでいる駒打ちの区分（drop_tried と同じ分け方）
+        let mut ts_dbk = 4usize;
+        let ts_counter = if cfg!(feature = "tree_stats") { Self::counter_index(pos).map(|i| self.counter[i]).unwrap_or(MOVE_NONE) } else { MOVE_NONE };
         // 実験S3：置換表の手が駒を取る手か
         let tt_capture = tt_move != MOVE_NONE && !mv_is_drop(tt_move) && pos.board[mv_to(tt_move)] != 0;
         // Late move pruning の判定（n はこの手を含めた合法手の数）。実験V11 で、指す前と指した後の両方から使う
@@ -1518,7 +1638,11 @@ impl Searcher {
                     prof!(self, 2, self.order_moves(pos, &list, &mut scores, tt_move, ply));
                 }
                 if next >= list.len { break; }
-                let m = prof!(self, 13, Self::pick_move(&mut list, &mut scores, next));
+                let m = if cfg!(feature = "v_seelazy") {
+                    prof!(self, 13, self.pick_lazy(pos, &mut list, &mut scores, next))
+                } else {
+                    prof!(self, 13, Self::pick_move(&mut list, &mut scores, next))
+                };
                 next += 1;
                 if tt_first && m == tt_move { continue; }
                 m
@@ -1526,6 +1650,8 @@ impl Searcher {
             if m == excluded { continue; }
             let to = mv_to(m);
             let is_cap = !mv_is_drop(m) && pos.board[to] != 0;
+            // 実験 段階1 V22：並べるときに分かった SEE ≥ 0（置換表の手は分からない）
+            let see_ok0 = self.known_see_ok(is_cap, m, tt_move, if next > 0 { scores[next - 1] } else { 0 });
             let is_promo = mv_is_promo(m);
             let quiet = !is_cap && !is_promo;
             let piece = if mv_is_drop(m) { make_piece(us, mv_drop_pt(m)) } else { pos.board[mv_from(m)] };
@@ -1572,7 +1698,8 @@ impl Searcher {
                 && best > -MATE_BOUND && depth <= 6
             {
                 let limit = if is_cap || is_promo || pre_check!(pre_check, pre_check_on, self, pos, m) { -218 * depth } else if depth <= 4 { -21 * depth * depth - 21 * depth } else { i32::MIN };
-                if limit > i32::MIN && !self.exchange_ge(pos, m, limit) {
+                // 実験 段階1 V22：駒取りで SEE ≥ 0 が分かっていれば、limit（負）以上も分かっている
+                if limit > i32::MIN && see_ok0 != Some(true) && !self.exchange_ge(pos, m, limit) {
                     continue;
                 }
             }
@@ -1605,7 +1732,10 @@ impl Searcher {
             let gives_check = pos.in_check();
             // 実験S1：損をしない王手（SEE が 0 以上）を1手延長する。延長はルートの深さの2倍の ply まで。
             // SEE は指す前の局面で調べるので、王手のときだけ戻して調べ、指し直す（実験 V6）
-            let check_ext = cfg!(feature = "s_check") && gives_check && ply < (2 * self.iteration_depth) as usize && {
+            let check_ext = cfg!(feature = "s_check") && gives_check && ply < (2 * self.iteration_depth) as usize && if let Some(ok) = see_ok0 {
+                // 実験 段階1 V22：並べるときに分かった SEE ≥ 0 を使う
+                ok
+            } else {
                 pos.undo_move();
                 let ok = self.exchange_ge(pos, m, 0);
                 pos.do_move(m);
@@ -1649,6 +1779,16 @@ impl Searcher {
             if quiet && n_quiets < 64 {
                 quiets_tried[n_quiets] = (piece, to);
                 n_quiets += 1;
+                if cfg!(feature = "tree_stats") && mv_is_drop(m) {
+                    ts_qdrops += 1;
+                    ts_dbk = 4;
+                    if m != tt_move && m != self.killers[ply][0] && m != self.killers[ply][1] && m != ts_counter {
+                        let k = pos.king[pos.side];
+                        let near = k != crate::position::NO_SQ && (k / 9).abs_diff(to / 9).max((k % 9).abs_diff(to % 9)) <= 2;
+                        ts_dbk = if gives_check { 0 } else if near { 1 } else if threatens_enemy_piece(pos, to) { 2 } else { 3 };
+                        self.ts.drop_tried[ts_dbk] += 1;
+                    }
+                }
             }
             if cfg!(feature = "s_caphist") && is_cap && n_caps < 32 {
                 caps_tried[n_caps] = (piece, to, cap_type);
@@ -1714,6 +1854,7 @@ impl Searcher {
                     } else if self.history[piece as usize * 81 + to] > tp(12) {
                         // ヒストリーの良い手は浅くしすぎない
                         r -= 1;
+                        ts!(self, lmr_hist);
                     }
                     if protected_reply { r -= 1; }
                     if threat_drop { r -= 1; }
@@ -1748,6 +1889,26 @@ impl Searcher {
                         tsd!(self, d_cut, d0);
                         tsd!(self, d_cut_moves, d0, legal + pruned);
                         if ts_searched == 1 { tsd!(self, d_cut_first, d0); }
+                        if cfg!(feature = "tree_stats") && excluded == MOVE_NONE {
+                            let counter = Self::counter_index(pos).map(|i| self.counter[i]).unwrap_or(MOVE_NONE);
+                            let k = if m == tt_move { 0 }
+                                else if is_cap { if pos.see(m) >= 0 { 1 } else { 2 } }
+                                else if is_promo { 3 }
+                                else if m == self.killers[ply][0] || m == self.killers[ply][1] { 4 }
+                                else if m == counter { 5 }
+                                else if mv_is_drop(m) { 7 } else { 6 };
+                            self.ts.cut_kind[k] += 1;
+                            self.ts.cut_kind_moves[k] += (legal + pruned) as u64;
+                            if k == 7 && mv_is_drop(m) && ts_dbk < 4 {
+                                self.ts.drop_cut[ts_dbk] += 1;
+                                self.ts.drop_cut_moves[ts_dbk] += (legal + pruned) as u64;
+                            }
+                            if quiet && n_quiets > 0 {
+                                let d = ts_qdrops - i32::from(mv_is_drop(m));
+                                self.ts.cut_qfail_drop += d as u64;
+                                self.ts.cut_qfail_board += (n_quiets as i32 - 1 - d) as u64;
+                            }
+                        }
                         // 実験S5：カットした駒取りを上げ、先に試して失敗した駒取りを下げる
                         if cfg!(feature = "s_caphist") && excluded == MOVE_NONE {
                             let bonus = (depth * depth).min(tp(15));
@@ -1766,7 +1927,10 @@ impl Searcher {
                                 self.counter[ci] = m;
                             }
                             // ヒストリー: カットした手を上げ、先に試して失敗した手を下げる
-                            let bonus = (depth * depth).min(tp(15));
+                            // 段階3 H1（h_bonus1）：16×深さ²（上限1600）／H2（h_bonus2）：150×深さ−100（上限1500）
+                            let bonus = if cfg!(feature = "h_bonus1") { (16 * depth * depth).min(1600) }
+                                else if cfg!(feature = "h_bonus2") { (150 * depth - 100).clamp(0, 1500) }
+                                else { (depth * depth).min(tp(15)) };
                             for k in 0..n_quiets {
                                 let (p, t) = quiets_tried[k];
                                 let h = &mut self.history[p as usize * 81 + t];
@@ -1927,7 +2091,11 @@ impl Searcher {
         let stand_pat = best;
         let recapture_sq = { let lm = pos.last_move(); if lm == MOVE_NONE { usize::MAX } else { mv_to(lm) } };
         for i in 0..list.len {
-            let m = prof!(self, 13, Self::pick_move(&mut list, &mut scores, i));
+            let m = if cfg!(feature = "v_seelazy") {
+                prof!(self, 13, self.pick_lazy(pos, &mut list, &mut scores, i))
+            } else {
+                prof!(self, 13, Self::pick_move(&mut list, &mut scores, i))
+            };
             if !in_check {
                 let captured = pos.board[mv_to(m)] != 0;
                 let checking = (extra_checks
@@ -1950,7 +2118,10 @@ impl Searcher {
                     continue;
                 }
                 // 取り合いで損をする駒取りは読まない
-                if !checking && self.feat & D_NO_QSEE == 0 && !self.exchange_ge(pos, m, 0) {
+                // 実験 段階1 V22：並べるときに分かった SEE ≥ 0 を使う
+                if !checking && self.feat & D_NO_QSEE == 0
+                    && !self.known_see_ok(captured, m, tt_move, scores[i]).unwrap_or_else(|| self.exchange_ge(pos, m, 0))
+                {
                     continue;
                 }
                 if !checking {
