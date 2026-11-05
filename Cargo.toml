@@ -21,9 +21,8 @@ panic = "abort"
 # 10/30 から s_prune2（実験S6 の軽い枝刈り）も既定（実験S13：singular の入った 3.0 の上で、AobaNNUE 相手 1,200局で +4.1ポイント）。
 # 10/31 から v_prelmp（実験 速さ2 の V11：LMP・futility を指す前に判定。読みは同じで約4.5%速い）も既定。
 # 11/1 から h_keep（実験 速さ3 の H1）と、ビットボードの v_bb・v_bbsee・v_bbgen（実験 速さ4 の V17〜V19。読みは同じで約1.18倍）も既定。
-# 11/3 から h_bonus2（段階3：静かな手のヒストリーの加点を 150×深さ−100、上限1500 に。AobaNNUE 相手 800局で +4.0ポイント）も既定。
-# 11/4 から t_bucket（段階2：置換表を2か所1組に。1スレッド・Hash16 の AobaNNUE 相手 800局で +3.9ポイント）も既定。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "h_bonus2", "t_bucket"]
+# h_bonus2（11/3）と t_bucket（11/4）は一度既定にしたが、11/6 に外した。両方入れた版は 3.1 に、AobaNNUE 相手 各800局で −1.3ポイント、自分同士 800局で 49.6%（baseline/compare31_20261104/PLAN.md）。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
