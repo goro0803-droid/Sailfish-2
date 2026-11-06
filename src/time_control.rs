@@ -23,8 +23,10 @@ pub fn allocate(time: u64, inc: u64, byoyomi: u64, delay: u64, game_ply: usize, 
     let soft_ms = soft.saturating_sub(delay).max(1).min(hard_ms);
     Budget { soft_ms, hard_ms }
 }
+/// 最善手・評価が不安定なときの soft の延長（4分のいくつか）。段階5の案B（cargo の機能 t_unst）は 1.75 倍、ふだんは 1.25 倍。
+pub const UNSTABLE_QUARTERS: u64 = if cfg!(feature = "t_unst") { 7 } else { 5 };
 pub fn stop_before_next(elapsed: u64, iteration: u64, previous: u64, soft: u64, hard: u64, stable: bool) -> bool {
-    let target = if stable { soft } else { soft.saturating_mul(5) / 4 }.min(hard);
+    let target = if stable { soft } else { soft.saturating_mul(UNSTABLE_QUARTERS) / 4 }.min(hard);
     if elapsed >= target { return true; }
     if elapsed < soft / 2 || previous == 0 { return false; }
     let ratio = (iteration as f64 / previous as f64).clamp(1.5, 6.0);
@@ -65,5 +67,15 @@ mod tests {
         assert!(!stop_before_next(1000,500,200,8000,12000,true));
         assert!(stop_before_next(12000,100,100,8000,12000,false));
         assert!(!stop_before_next(8500,100,100,8000,12000,false));
+    }
+    #[test] fn unstable_extension_follows_the_feature_and_stays_under_hard() {
+        let quarters = if cfg!(feature = "t_unst") { 7 } else { 5 };
+        assert_eq!(UNSTABLE_QUARTERS, quarters);
+        // soft 8000 の目標は 10000（ふだん）か 14000（t_unst）。その手前は続け、越えたら止める
+        let target = 8000 * quarters / 4;
+        assert!(!stop_before_next(target - 100, 10, 10, 8000, 20000, false));
+        assert!(stop_before_next(target, 10, 10, 8000, 20000, false));
+        // 上限（hard）は超えない
+        assert!(stop_before_next(9000, 10, 10, 8000, 9000, false));
     }
 }

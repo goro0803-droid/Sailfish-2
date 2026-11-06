@@ -1068,7 +1068,7 @@ impl Searcher {
                 // 実験T1（cargo の機能 time_unstable）：最善手・評価が落ち着いていなければ、soft の 1.25 倍（hard まで）まで次の反復を始める。
                 // stop_before_next の目標と同じ。既定では soft で必ず打ち切るので、この延長は働かない。
                 let soft_limit = if cfg!(feature = "time_unstable") && self.limits.adaptive_time && stable_iterations < 2 {
-                    (self.limits.soft_ms.saturating_mul(5) / 4).min(self.limits.hard_ms)
+                    (self.limits.soft_ms.saturating_mul(crate::time_control::UNSTABLE_QUARTERS) / 4).min(self.limits.hard_ms)
                 } else {
                     self.limits.soft_ms
                 };
