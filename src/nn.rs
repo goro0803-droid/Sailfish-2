@@ -25,8 +25,8 @@ pub const H: usize = 256;
 pub const H: usize = 64;
 #[cfg(feature = "h128")]
 pub const H: usize = 128;
-/// 第 2 層の幅
-pub const L2: usize = 32;
+/// 第 2 層の幅（段階6の実験では cargo の機能 l2_64 で 64。ネットとエンジンで同じ幅にそろえる。8 の倍数にする）
+pub const L2: usize = if cfg!(feature = "l2_64") { 64 } else { 32 };
 /// 持ち駒の種類ごとの最大枚数（歩 香 桂 銀 角 飛 金）
 const HAND_CAP: [usize; 8] = [0, 18, 4, 4, 4, 2, 2, 4];
 /// 持ち駒の特徴の開始位置（駒種ごと）
@@ -927,11 +927,16 @@ fn set_global(net: Network) {
     }
 }
 
-/// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn）。
+/// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn。11/7 から段階6の L64H で、第2層が 64 なので機能 l2_64 が要る）。
 /// cargo の機能 net_b4 なら実験B4（20エポック）の、net_b5 なら実験B5（水匠10 のデータを追加）の、
 /// net_nh なら実験NH（土台を駒の損得だけにして、手作りの評価を使わない）のネットを埋め込む。
-#[cfg(not(any(feature = "net_b4", feature = "net_b5", feature = "net_nh")))]
+/// net_l64h・net_l64m は段階6の実験（第2層を 64 に。土台はそれぞれ手作りの評価・駒の損得だけ）のネットを埋め込む。
+#[cfg(not(any(feature = "net_b4", feature = "net_b5", feature = "net_nh", feature = "net_l64h", feature = "net_l64m")))]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/default.nn");
+#[cfg(feature = "net_l64h")]
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/l64h.nn");
+#[cfg(feature = "net_l64m")]
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/l64m.nn");
 #[cfg(all(feature = "net_nh", not(any(feature = "net_b4", feature = "net_b5"))))]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/nh.nn");
 #[cfg(feature = "net_b4")]

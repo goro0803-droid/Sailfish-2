@@ -31,6 +31,9 @@ const DEFEND_BONUS: [i32; 9] = [0, 30, 20, 8, 0, 0, 0, 0, 0];
 /// 玉の段（自陣の奥 = 8）ごとのボーナス
 const KING_RANK: [i32; 9] = [-80, -70, -60, -40, -20, -5, 5, 15, 10];
 
+/// 取られそうな駒（相手の利きがあって自分の利きがない駒）の減点。駒の価値の 16分のいくつか。段階6の実験（cargo の機能 e_hang3）は 3
+const HANG_MUL: i32 = if cfg!(feature = "e_hang3") { 3 } else { 1 };
+
 /// 玉を攻めるときの持ち駒の重み（歩 香 桂 銀 角 飛 金）
 const HAND_ATTACK: [i32; 8] = [0, 1, 2, 3, 4, 5, 6, 4];
 
@@ -199,6 +202,57 @@ pub fn evaluate(pos: &Position) -> i32 {
     }
 }
 
+/// 手作りの評価の部品の名前（`eval_components` の順番）
+pub const EVAL_COMPONENT_NAMES: [&str; 7] = ["玉の危険度", "大駒の動ける升", "取られそうな駒", "敵玉への近さ", "自玉の守り", "玉の段", "駒の点数表"];
+
+/// 手作りの評価を部品に分ける（段階6 NH の診断用。手番側から見た値）。部品の合計に駒割りを足すと `evaluate` と同じ値になる
+pub fn eval_components(pos: &Position) -> [i32; 7] {
+    let mut att = [[0u8; 81]; 2];
+    let mut mobility = [0i32; 2];
+    attack_map(pos, &mut att, &mut mobility);
+    let mut part = [[0i32; 7]; 2];
+    for sq in 0..81 {
+        let p = pos.board[sq];
+        if p == 0 {
+            continue;
+        }
+        let c = color_of(p);
+        let pt = type_of(p);
+        part[c][6] += PST[pt as usize][if c == BLACK { sq } else { 80 - sq }] as i32;
+        if pt == KING {
+            part[c][5] += KING_RANK[rel_rank(c, sq % 9)];
+            continue;
+        }
+        let ek = pos.king[c ^ 1];
+        if ek != NO_SQ {
+            let b = ATTACK_BONUS[dist(sq, ek)];
+            part[c][3] += match pt {
+                PAWN | BISHOP | ROOK => b / 2,
+                _ => b,
+            };
+        }
+        let ok = pos.king[c];
+        if ok != NO_SQ && matches!(pt, GOLD | SILVER | PRO_PAWN | PRO_LANCE | PRO_KNIGHT | PRO_SILVER) {
+            part[c][4] += DEFEND_BONUS[dist(sq, ok)];
+        }
+        if att[c ^ 1][sq] > 0 && att[c][sq] == 0 {
+            part[c][2] -= PIECE_VALUE[pt as usize] * HANG_MUL / 16;
+        }
+    }
+    let kd = KING_DANGER_PCT.load(Ordering::Relaxed);
+    let mw = MOBILITY_WEIGHT.load(Ordering::Relaxed);
+    for c in 0..2 {
+        part[c][1] += mobility[c] * mw;
+        part[c][0] -= king_danger(pos, c, |c, s| att[c][s] as i32) * kd / 100;
+    }
+    let sign = if pos.side == BLACK { 1 } else { -1 };
+    let mut out = [0i32; 7];
+    for i in 0..7 {
+        out[i] = sign * (part[BLACK][i] - part[WHITE][i]);
+    }
+    out
+}
+
 /// 駒の点数表を除いた評価値（先手から見た値）。学習用。
 pub fn eval_without_pst(pos: &Position) -> i32 {
     let score = eval_impl::<false>(pos);
@@ -271,7 +325,7 @@ fn eval_fast(pos: &Position) -> [i32; 2] {
             score[c] += DEFEND_BONUS[t.dist[sq][ok] as usize];
         }
         if att[c ^ 1][sq] > 0 && att[c][sq] == 0 {
-            score[c] -= PIECE_VALUE[pt as usize] / 16;
+            score[c] -= PIECE_VALUE[pt as usize] * HANG_MUL / 16;
         }
     }
     let kd = KING_DANGER_PCT.load(Ordering::Relaxed);
@@ -358,7 +412,7 @@ fn eval_bb(pos: &Position) -> [i32; 2] {
             score[c] += DEFEND_BONUS[t.dist[sq][ok] as usize];
         }
         if (any[c ^ 1] >> sq) & 1 != 0 && (any[c] >> sq) & 1 == 0 {
-            score[c] -= PIECE_VALUE[pt as usize] / 16;
+            score[c] -= PIECE_VALUE[pt as usize] * HANG_MUL / 16;
         }
     }
     let kd = KING_DANGER_PCT.load(Ordering::Relaxed);
@@ -452,7 +506,7 @@ fn eval_zone(pos: &Position) -> [i32; 2] {
             score[c] += DEFEND_BONUS[t.dist[sq][ok] as usize];
         }
         if (any[c ^ 1] >> sq) & 1 != 0 && (any[c] >> sq) & 1 == 0 {
-            score[c] -= PIECE_VALUE[pt as usize] / 16;
+            score[c] -= PIECE_VALUE[pt as usize] * HANG_MUL / 16;
         }
     }
     let kd = KING_DANGER_PCT.load(Ordering::Relaxed);
@@ -470,6 +524,41 @@ fn eval_zone(pos: &Position) -> [i32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 段階6：部品の合計に駒割りを足すと、評価値と同じになる
+    #[test]
+    fn components_sum_to_evaluate() {
+        let mut rng = 987654321u64;
+        let mut pos = Position::startpos();
+        let mut ply = 0;
+        for i in 0..5000 {
+            let mut mat = [0i32; 2];
+            for sq in 0..81 {
+                let p = pos.board[sq];
+                if p != 0 && type_of(p) != KING {
+                    mat[color_of(p)] += PIECE_VALUE[type_of(p) as usize];
+                }
+            }
+            for c in 0..2 {
+                for pt in 1..8 {
+                    mat[c] += HAND_VALUE[pt] * pos.hand[c][pt] as i32;
+                }
+            }
+            let m = if pos.side == BLACK { mat[BLACK] - mat[WHITE] } else { mat[WHITE] - mat[BLACK] };
+            assert_eq!(eval_components(&pos).iter().sum::<i32>() + m, evaluate(&pos), "{} 局面目", i);
+            let legal = pos.legal_moves();
+            if legal.is_empty() || ply > 250 {
+                pos = Position::startpos();
+                ply = 0;
+                continue;
+            }
+            ply += 1;
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            pos.do_move(legal[(rng % legal.len() as u64) as usize]);
+        }
+    }
 
     /// 実験 速さ4 V15：駒のある升だけをたどる評価が、前の評価とすべての局面で一致する
     #[test]
@@ -535,7 +624,7 @@ fn eval_impl<const PST_ON: bool>(pos: &Position) -> [i32; 2] {
         }
         // 相手の利きがあって、自分の利きがない駒（取られそうな駒）は少し減点
         if att[c ^ 1][sq] > 0 && att[c][sq] == 0 {
-            score[c] -= PIECE_VALUE[pt as usize] / 16;
+            score[c] -= PIECE_VALUE[pt as usize] * HANG_MUL / 16;
         }
     }
     let kd = KING_DANGER_PCT.load(Ordering::Relaxed);
