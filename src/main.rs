@@ -301,6 +301,7 @@ impl Engine {
         searcher.limits = limits;
         searcher.multipv = self.multipv;
         searcher.threads = self.threads;
+        searcher.game_ply = self.game_ply;
         let mut pos = self.pos.clone();
         self.handle = Some(
             thread::Builder::new()

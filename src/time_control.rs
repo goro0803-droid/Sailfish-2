@@ -25,8 +25,14 @@ pub fn allocate(time: u64, inc: u64, byoyomi: u64, delay: u64, game_ply: usize, 
 }
 /// 最善手・評価が不安定なときの soft の延長（4分のいくつか）。段階5の案B（cargo の機能 t_unst）は 1.75 倍、ふだんは 1.25 倍。
 pub const UNSTABLE_QUARTERS: u64 = if cfg!(feature = "t_unst") { 7 } else { 5 };
+/// 実験 t_fall（11/10）：前の自分の手番より評価が下がったときの soft の延長（4分のいくつか）
+pub const FALL_QUARTERS: u64 = 6;
 pub fn stop_before_next(elapsed: u64, iteration: u64, previous: u64, soft: u64, hard: u64, stable: bool) -> bool {
-    let target = if stable { soft } else { soft.saturating_mul(UNSTABLE_QUARTERS) / 4 }.min(hard);
+    stop_before_next_q(elapsed, iteration, previous, soft, hard, if stable { 4 } else { UNSTABLE_QUARTERS })
+}
+/// 目標を soft の 4分の quarters 倍（hard まで）にして、次の反復を始めずに止めるかを決める
+pub fn stop_before_next_q(elapsed: u64, iteration: u64, previous: u64, soft: u64, hard: u64, quarters: u64) -> bool {
+    let target = (soft.saturating_mul(quarters) / 4).min(hard);
     if elapsed >= target { return true; }
     if elapsed < soft / 2 || previous == 0 { return false; }
     let ratio = (iteration as f64 / previous as f64).clamp(1.5, 6.0);

@@ -307,6 +307,9 @@ pub struct QNet {
     w1: Vec<i16>,
     b1: Vec<i16>,
     w2: Vec<i16>,
+    /// 実験 速さ5 V24（v_sparse）：第2層の重みを入力の組（i16 2つ）ごとに並べ替えた写し。[組 p][出力 j][2]
+    #[cfg(feature = "v_sparse")]
+    w2p: Vec<i16>,
     b2: Vec<i32>,
     /// 出力層の重みを S1·S2 で割ったもの（第2層の出力を整数のまま掛けられるように）
     w3: Vec<f32>,
@@ -317,12 +320,27 @@ impl QNet {
     fn from_network(n: &Network, s1: i32, s2: i32) -> QNet {
         let q16 = |x: f32, s: i32| (x * s as f32).round().clamp(-32767.0, 32767.0) as i16;
         let s12 = (s1 as i64 * s2 as i64) as f32;
+        let w2: Vec<i16> = n.w2.iter().map(|&x| q16(x, s2)).collect();
+        #[cfg(feature = "v_sparse")]
+        let w2p = {
+            let mut v = vec![0i16; w2.len()];
+            for p in 0..H {
+                for j in 0..L2 {
+                    for t in 0..2 {
+                        v[p * 2 * L2 + 2 * j + t] = w2[j * 2 * H + 2 * p + t];
+                    }
+                }
+            }
+            v
+        };
         QNet {
             s1,
             s2,
             w1: n.w1.iter().map(|&x| q16(x, s1)).collect(),
             b1: n.b1.iter().map(|&x| q16(x, s1)).collect(),
-            w2: n.w2.iter().map(|&x| q16(x, s2)).collect(),
+            w2,
+            #[cfg(feature = "v_sparse")]
+            w2p,
             b2: n.b2.iter().map(|&x| (x * s12).round() as i32).collect(),
             w3: n.w3.iter().map(|&x| x / s12).collect(),
             b3: n.b3,
@@ -445,9 +463,40 @@ unsafe fn forward_q_avx2(q: &QNet, acc: &Acc, stm: usize) -> f32 {
             _mm256_storeu_si256(x.as_mut_ptr().add(persp * H + i) as *mut __m256i, c);
         }
     }
+    // V24：0 でない入力の組だけ、32出力ぶんの重みの列と積和する（整数の和なので順番を変えても値は同じ）
+    #[cfg(feature = "v_sparse")]
+    let sums = {
+        const NB: usize = L2 / 8;
+        let mut s = [_mm256_setzero_si256(); NB];
+        let xi = x.as_ptr() as *const i32;
+        let w = q.w2p.as_ptr();
+        for c in (0..H).step_by(8) {
+            let v = _mm256_loadu_si256(xi.add(c) as *const __m256i);
+            let zmask = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, zero))) as u32;
+            let mut nz = !zmask & 0xff;
+            while nz != 0 {
+                let p = c + nz.trailing_zeros() as usize;
+                nz &= nz - 1;
+                let input = _mm256_set1_epi32(*xi.add(p));
+                let wp = w.add(p * 2 * L2);
+                for b in 0..NB {
+                    let wk = _mm256_loadu_si256(wp.add(b * 16) as *const __m256i);
+                    s[b] = _mm256_add_epi32(s[b], _mm256_madd_epi16(input, wk));
+                }
+            }
+        }
+        let mut sums = [0i32; L2];
+        for b in 0..NB {
+            _mm256_storeu_si256(sums.as_mut_ptr().add(b * 8) as *mut __m256i, s[b]);
+        }
+        sums
+    };
     // 第2層の8行をまとめて計算し、入力の読み込みを共有する。8行の和は hadd でまとめて1本にする（実験 V2。整数の和なので順番を変えても同じ値）
+    #[cfg(not(feature = "v_sparse"))]
     let mut sums = [0i32; L2];
+    #[cfg(not(feature = "v_sparse"))]
     let mut j = 0;
+    #[cfg(not(feature = "v_sparse"))]
     while j < L2 {
         let w = q.w2.as_ptr().add(j * 2 * H);
         let mut s = [_mm256_setzero_si256(); 8];

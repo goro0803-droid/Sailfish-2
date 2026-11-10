@@ -293,6 +293,9 @@ pub struct Searcher {
     pub threads: usize,
     /// 0 = 主スレッド（info の出力・時間管理を行う）、1 以上 = 補助スレッド
     helper_idx: usize,
+    /// 実験 t_fall（11/10）：今の局面の手数（USI の側で入れる）と、前の思考の（手数, 最後の評価）
+    pub game_ply: usize,
+    last_root: Option<(usize, i32)>,
     /// 有効な探索の改良（F_ のビット）
     feat: u32,
     /// 各 ply の静的評価値（王手を受けているときは -INF）
@@ -607,6 +610,7 @@ impl Searcher {
     /// 新しい対局：評価補正履歴の表を消す
     pub fn new_game(&mut self) {
         self.corr.iter_mut().for_each(|e| *e = 0);
+        self.last_root = None;
         for h in &mut self.helpers {
             h.new_game();
         }
@@ -624,6 +628,8 @@ impl Searcher {
             multipv: 1,
             threads: 1,
             helper_idx: 0,
+            game_ply: 0,
+            last_root: None,
             feat: 0,
             static_evals: [-INF; MAX_PLY + 2],
             ecache: vec![(0, i32::MIN); 1 << ECACHE_BITS],
@@ -1061,13 +1067,19 @@ impl Searcher {
             }
             let iteration_ms = self.elapsed_ms().saturating_sub(iteration_start);
             stable_iterations = if best == prior_best && (score-prior_score).abs()<80 { stable_iterations+1 } else { 0 };
-            let predicted_stop = self.limits.adaptive_time && depth >= 5 && crate::time_control::stop_before_next(self.elapsed_ms(), iteration_ms, previous_iteration_ms, self.limits.soft_ms, self.limits.hard_ms, stable_iterations>=2);
+            // 実験 t_fall：前の自分の手番より 60点以上低ければ、soft の 1.5 倍（hard まで）を目標にする
+            let falling = cfg!(feature = "t_fall") && self.limits.adaptive_time && score.abs() < MATE_BOUND
+                && self.last_root.is_some_and(|(p, s)| p + 2 == self.game_ply && s.abs() < MATE_BOUND && s - score >= 60);
+            let quarters = if falling { crate::time_control::FALL_QUARTERS } else if stable_iterations >= 2 { 4 } else { crate::time_control::UNSTABLE_QUARTERS };
+            let predicted_stop = self.limits.adaptive_time && depth >= 5 && crate::time_control::stop_before_next_q(self.elapsed_ms(), iteration_ms, previous_iteration_ms, self.limits.soft_ms, self.limits.hard_ms, quarters);
             previous_iteration_ms = iteration_ms;
             let pondering = self.shared.ponder.load(Ordering::Relaxed);
             if !self.limits.infinite && !pondering {
                 // 実験T1（cargo の機能 time_unstable）：最善手・評価が落ち着いていなければ、soft の 1.25 倍（hard まで）まで次の反復を始める。
                 // stop_before_next の目標と同じ。既定では soft で必ず打ち切るので、この延長は働かない。
-                let soft_limit = if cfg!(feature = "time_unstable") && self.limits.adaptive_time && stable_iterations < 2 {
+                let soft_limit = if falling {
+                    (self.limits.soft_ms.saturating_mul(crate::time_control::FALL_QUARTERS) / 4).min(self.limits.hard_ms)
+                } else if cfg!(feature = "time_unstable") && self.limits.adaptive_time && stable_iterations < 2 {
                     (self.limits.soft_ms.saturating_mul(crate::time_control::UNSTABLE_QUARTERS) / 4).min(self.limits.hard_ms)
                 } else {
                     self.limits.soft_ms
@@ -1082,6 +1094,9 @@ impl Searcher {
             }
         }
 
+        if is_main && cfg!(feature = "t_fall") {
+            self.last_root = Some((self.game_ply, prev_score));
+        }
         (best, ponder)
     }
 
