@@ -27,6 +27,23 @@ pub const H: usize = 64;
 pub const H: usize = 128;
 /// 第 2 層の幅（段階6の実験では cargo の機能 l2_64 で 64。ネットとエンジンで同じ幅にそろえる。8 の倍数にする）
 pub const L2: usize = if cfg!(feature = "l2_64") { 64 } else { 32 };
+/// 実験 LS（11/10、cargo の機能 ls4）：第2層・第3層の重みの組の数。盤上の駒の数で組を選ぶ（第1層と出力の偏り b3 は共有）。
+/// 組が1つ（既定）なら、ファイルも計算も今までと同じ
+pub const NB: usize = if cfg!(feature = "ls4") { 4 } else { 1 };
+/// 組の境目：盤上の駒の数が LS_T[k] 以上なら組 k まで（多い順に組 0, 1, 2, 3）。学習データ（train_b5.psv の先頭・中ほど・終わり 各100万局面）の4分位：36以上 25.1%、33〜35 30.5%、31〜32 17.5%、30以下 26.9%
+pub const LS_T: [u8; 3] = [36, 33, 31];
+#[cfg(all(feature = "ls4", feature = "v_sparse"))]
+compile_error!("ls4 と v_sparse は同時に使えない");
+/// 盤上の駒の数から組の番号を決める
+#[inline]
+pub fn bucket_of(npc: u8) -> usize {
+    if NB == 1 { return 0; }
+    if npc >= LS_T[0] { 0 } else if npc >= LS_T[1] { 1 } else if npc >= LS_T[2] { 2 } else { 3 }
+}
+/// 盤上の駒の数（玉を含む）
+pub fn board_count(board: &[u8; 81]) -> u8 {
+    board.iter().filter(|&&p| p != 0).count() as u8
+}
 /// 持ち駒の種類ごとの最大枚数（歩 香 桂 銀 角 飛 金）
 const HAND_CAP: [usize; 8] = [0, 18, 4, 4, 4, 2, 2, 4];
 /// 持ち駒の特徴の開始位置（駒種ごと）
@@ -40,6 +57,10 @@ const MAGIC: &[u8; 4] = b"SFNN";
 const VERSION: u32 = 3;
 /// ファイルの先頭（マジック 4 + バージョン・H・L2・特徴数・土台の種類 各 4）
 const HEADER_LEN: usize = 4 + 5 * 4;
+/// ファイルのバージョン。組が2つ以上なら、上位の16ビットに（組の数 − 1）を入れる（組が1つなら今までと同じ 3）
+fn file_version() -> u32 {
+    VERSION | ((NB as u32 - 1) << 16)
+}
 
 // 入力の特徴は2種類。どちらも N_FEATS・piece_feats・hand_feat・mirror_feature を同じ形で用意する。
 //   kp（標準）  : 駒の升・持ち駒・玉からの相対位置（約4,900）
@@ -273,11 +294,13 @@ pub struct Acc {
     pub q: [[i16; H]; 2],
     /// 先手から見た駒割り
     pub mat: i32,
+    /// 盤上の駒の数（実験 LS の組を選ぶ）
+    pub npc: u8,
 }
 
 impl Default for Acc {
     fn default() -> Self {
-        Acc { v: [[0.0; H]; 2], q: [[0; H]; 2], mat: 0 }
+        Acc { v: [[0.0; H]; 2], q: [[0; H]; 2], mat: 0, npc: 0 }
     }
 }
 
@@ -287,6 +310,7 @@ impl Acc {
     pub fn copy_from(&mut self, o: &Acc, quant: bool) {
         if quant { self.q = o.q; } else { self.v = o.v; }
         self.mat = o.mat;
+        self.npc = o.npc;
     }
 }
 
@@ -436,7 +460,8 @@ fn forward_q_scalar(q: &QNet, acc: &Acc, stm: usize) -> f32 {
         x[H + i] = acc.q[stm ^ 1][i].clamp(0, q.s1 as i16);
     }
     let mut out = q.b3;
-    for j in 0..L2 {
+    let o = bucket_of(acc.npc) * L2;
+    for j in o..o + L2 {
         let w = &q.w2[j * 2 * H..(j + 1) * 2 * H];
         let mut s = 0i32;
         for i in 0..2 * H {
@@ -498,7 +523,7 @@ unsafe fn forward_q_avx2(q: &QNet, acc: &Acc, stm: usize) -> f32 {
     let mut j = 0;
     #[cfg(not(feature = "v_sparse"))]
     while j < L2 {
-        let w = q.w2.as_ptr().add(j * 2 * H);
+        let w = q.w2.as_ptr().add((bucket_of(acc.npc) * L2 + j) * 2 * H);
         let mut s = [_mm256_setzero_si256(); 8];
         for i in (0..2 * H).step_by(16) {
             let input = _mm256_loadu_si256(x.as_ptr().add(i) as *const __m256i);
@@ -519,9 +544,10 @@ unsafe fn forward_q_avx2(q: &QNet, acc: &Acc, stm: usize) -> f32 {
     }
     // 出力層は小数なので、これまでと同じ順番（j の小さい順）で足す
     let mut out = q.b3;
+    let o = bucket_of(acc.npc) * L2;
     for j in 0..L2 {
-        let z = q.b2[j].wrapping_add(sums[j]).clamp(0, q.s1 * q.s2);
-        out += q.w3[j] * z as f32;
+        let z = q.b2[o + j].wrapping_add(sums[j]).clamp(0, q.s1 * q.s2);
+        out += q.w3[o + j] * z as f32;
     }
     out
 }
@@ -595,9 +621,9 @@ impl Network {
         Network {
             w1: (0..N_FEATS * H).map(|_| rnd() * 0.06).collect(),
             b1: vec![0.3; H],
-            w2: (0..L2 * 2 * H).map(|_| rnd() * 0.12).collect(),
-            b2: vec![0.5; L2],
-            w3: (0..L2).map(|_| rnd() * 0.1).collect(),
+            w2: (0..NB * L2 * 2 * H).map(|_| rnd() * 0.12).collect(),
+            b2: vec![0.5; NB * L2],
+            w3: (0..NB * L2).map(|_| rnd() * 0.1).collect(),
             b3: 0.0,
             base_hc: false,
             q: None,
@@ -643,6 +669,7 @@ impl Network {
             }
         }
         acc.mat = material_arrays(board, hand);
+        acc.npc = board_count(board);
     }
 
     /// 局面から最初のアキュムレータを作る
@@ -726,6 +753,7 @@ impl Network {
             }
             self.piece(to, true, us, pt, dst, kings);
             to.mat += sign * (PIECE_VALUE[pt as usize] - HAND_VALUE[pt as usize]);
+            to.npc += 1;
         } else {
             let src = mv_from(m);
             let npt = type_of(pos.board[dst]); // 指したあとの駒種（成っていれば成り駒）
@@ -743,6 +771,7 @@ impl Network {
                     self.add(to, persp, hand_feat(persp, us, hpt, n, kings));
                 }
                 to.mat += sign * (HAND_VALUE[hpt as usize] + PIECE_VALUE[cpt as usize]);
+                to.npc -= 1;
             }
         }
     }
@@ -757,6 +786,7 @@ impl Network {
         let mut ops = [[(0usize, false); 12]; 2];
         let mut n = [0usize; 2];
         let mut mat = from.mat;
+        let mut npc = from.npc;
         if mv_is_drop(m) {
             let pt = mv_drop_pt(m);
             let before = (pos.hand[us][pt as usize] as usize + 1).min(HAND_CAP[pt as usize]);
@@ -766,6 +796,7 @@ impl Network {
             }
             push_piece_ops(&mut ops, &mut n, true, us, pt, dst, kings);
             mat += sign * (PIECE_VALUE[pt as usize] - HAND_VALUE[pt as usize]);
+            npc += 1;
         } else {
             let src = mv_from(m);
             let npt = type_of(pos.board[dst]);
@@ -783,12 +814,14 @@ impl Network {
                     n[persp] += 1;
                 }
                 mat += sign * (HAND_VALUE[hpt as usize] + PIECE_VALUE[cpt as usize]);
+                npc -= 1;
             }
         }
         for persp in 0..2 {
             q_apply(q, &from.q[persp], &mut to.q[persp], &ops[persp][..n[persp]]);
         }
         to.mat = mat;
+        to.npc = npc;
     }
 
     /// ネットワークの出力（土台を足す前、-1〜1 くらいの値）
@@ -813,7 +846,8 @@ impl Network {
             x[H + i] = acc.v[stm ^ 1][i].clamp(0.0, 1.0);
         }
         let mut out = self.b3;
-        for j in 0..L2 {
+        let o = bucket_of(acc.npc) * L2;
+        for j in o..o + L2 {
             let z = self.b2[j] + dot(&self.w2[j * 2 * H..(j + 1) * 2 * H], &x);
             out += self.w3[j] * z.clamp(0.0, 1.0);
         }
@@ -840,8 +874,9 @@ impl Network {
             }
         }
         let mut out = self.b3;
-        let mut j = 0;
-        while j + 4 <= L2 {
+        let o = bucket_of(acc.npc) * L2;
+        let mut j = o;
+        while j + 4 <= o + L2 {
             let weights = &self.w2[j * 2 * H..(j + 4) * 2 * H];
             let mut sums = [_mm256_setzero_ps(); 4];
             for i in (0..2 * H).step_by(8) {
@@ -859,7 +894,7 @@ impl Network {
             }
             j += 4;
         }
-        for k in j..L2 {
+        for k in j..o + L2 {
             let z = self.b2[k] + dot_avx(&self.w2[k * 2 * H..(k + 1) * 2 * H], &x);
             out += self.w3[k] * z.clamp(0.0, 1.0);
         }
@@ -894,7 +929,7 @@ impl Network {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(MAGIC);
-        for v in [VERSION, H as u32, L2 as u32, N_FEATS as u32, self.base_hc as u32] {
+        for v in [file_version(), H as u32, L2 as u32, N_FEATS as u32, self.base_hc as u32] {
             b.extend_from_slice(&v.to_le_bytes());
         }
         for arr in [&self.w1, &self.b1, &self.w2, &self.b2, &self.w3] {
@@ -911,11 +946,11 @@ impl Network {
             return Err("ネットワークファイルではありません".into());
         }
         let u = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-        if u(4) != VERSION || u(8) as usize != H || u(12) as usize != L2 || u(16) as usize != N_FEATS {
+        if u(4) != file_version() || u(8) as usize != H || u(12) as usize != L2 || u(16) as usize != N_FEATS {
             return Err("ネットワークの形（バージョン・幅）がこのエンジンと合いません".into());
         }
         let base_hc = u(20) != 0;
-        let total = N_FEATS * H + H + L2 * 2 * H + L2 + L2 + 1;
+        let total = N_FEATS * H + H + NB * (L2 * 2 * H + L2 + L2) + 1;
         if b.len() != HEADER_LEN + total * 4 {
             return Err("ネットワークファイルの大きさが合いません".into());
         }
@@ -927,9 +962,9 @@ impl Network {
         };
         let w1 = take(N_FEATS * H);
         let b1 = take(H);
-        let w2 = take(L2 * 2 * H);
-        let b2 = take(L2);
-        let w3 = take(L2);
+        let w2 = take(NB * L2 * 2 * H);
+        let b2 = take(NB * L2);
+        let w3 = take(NB * L2);
         let b3 = take(1)[0];
         let mut net = Network { w1, b1, w2, b2, w3, b3, base_hc, q: None };
         if QUANT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -980,8 +1015,11 @@ fn set_global(net: Network) {
 /// cargo の機能 net_b4 なら実験B4（20エポック）の、net_b5 なら実験B5（水匠10 のデータを追加）の、
 /// net_nh なら実験NH（土台を駒の損得だけにして、手作りの評価を使わない）のネットを埋め込む。
 /// net_l64h・net_l64m は段階6の実験（第2層を 64 に。土台はそれぞれ手作りの評価・駒の損得だけ）のネットを埋め込む。
-#[cfg(not(any(feature = "net_b4", feature = "net_b5", feature = "net_nh", feature = "net_l64h", feature = "net_l64m")))]
+#[cfg(not(any(feature = "net_b4", feature = "net_b5", feature = "net_nh", feature = "net_l64h", feature = "net_l64m", feature = "net_ls4")))]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/default.nn");
+/// 実験 LS（11/10）：組を4つにしたネット（nets/ls4.nn。学習が終わってから置く）
+#[cfg(feature = "net_ls4")]
+static DEFAULT_NET: &[u8] = include_bytes!("../nets/ls4.nn");
 #[cfg(feature = "net_l64h")]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/l64h.nn");
 #[cfg(feature = "net_l64m")]
@@ -1019,7 +1057,8 @@ mod tests {
                         x[H + i] = acc.v[stm ^ 1][i].clamp(0.0, 1.0);
                     }
                     let mut reference = net.b3;
-                    for j in 0..L2 {
+                    let o = bucket_of(acc.npc) * L2;
+                    for j in o..o + L2 {
                         let w = &net.w2[j * 2 * H..(j + 1) * 2 * H];
                         let expected = dot_scalar(w, &x);
                         assert_eq!(dot(w, &x).to_bits(), expected.to_bits());
@@ -1056,7 +1095,8 @@ mod tests {
                 x[H + i] = acc.v[stm ^ 1][i].clamp(0.0, 1.0);
             }
             let mut expected = net.b3;
-            for j in 0..L2 {
+            let o = bucket_of(acc.npc) * L2;
+            for j in o..o + L2 {
                 let z = net.b2[j] + dot_scalar(&net.w2[j * 2 * H..(j + 1) * 2 * H], &x);
                 expected += net.w3[j] * z.clamp(0.0, 1.0);
             }
@@ -1103,6 +1143,7 @@ mod tests {
                 let mut fresh = Acc::default();
                 net.refresh(&pos, &mut fresh);
                 assert_eq!(next.mat, fresh.mat, "駒割りが合わない（{} 手目）", ply);
+                assert_eq!(next.npc, fresh.npc, "盤上の駒の数が合わない（{} 手目）", ply);
                 for p in 0..2 {
                     for i in 0..H {
                         assert!(

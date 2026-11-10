@@ -32,11 +32,12 @@ struct Data {
     hc: Vec<f32>,    // 手作りの評価関数（手番側から見た値）
     score: Vec<f32>, // 探索の評価値（手番側から見た値）
     res: Vec<f32>,   // 手番側から見た結果 1 / 0.5 / 0
+    bk: Vec<u8>,     // 実験 LS：第2・第3層の組の番号（盤上の駒の数から。左右反転しても同じ）
 }
 
 impl Data {
     fn new() -> Data {
-        Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![] }
+        Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![], bk: vec![] }
     }
     fn len(&self) -> usize {
         self.mat.len()
@@ -57,6 +58,7 @@ impl Data {
         self.hc.push(hc);
         self.score.push(score);
         self.res.push(res);
+        self.bk.push(bucket_of(board_count(&pos.board)) as u8);
     }
     fn append(&mut self, o: Data) {
         let base = *self.off.last().unwrap();
@@ -67,6 +69,7 @@ impl Data {
         self.hc.extend_from_slice(&o.hc);
         self.score.extend_from_slice(&o.score);
         self.res.extend_from_slice(&o.res);
+        self.bk.extend_from_slice(&o.bk);
     }
 }
 
@@ -78,7 +81,7 @@ fn mirror_table() -> &'static [u32] {
 
 /// 棋譜を読み、静かな局面を集める。戻り値は (データ, 検証用に分ける最初のサンプル番号)
 fn load(paths: &[String], base_hc: bool, filter: TrainingFilter, dedup: bool) -> (Data, usize) {
-    let mut d = Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![] };
+    let mut d = Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![], bk: vec![] };
     let mut game_starts: Vec<usize> = vec![];
     let mut seen = HashSet::new();
     let mut tmp: Vec<u32> = Vec::with_capacity(64);
@@ -115,6 +118,7 @@ fn load(paths: &[String], base_hc: bool, filter: TrainingFilter, dedup: bool) ->
                     d.hc.push(hc);
                     d.score.push(score);
                     d.res.push(if stm == BLACK { result } else { 1.0 - result });
+                    d.bk.push(bucket_of(board_count(&pos.board)) as u8);
                 }
                 pos.do_move(m);
             }
@@ -131,7 +135,7 @@ fn load(paths: &[String], base_hc: bool, filter: TrainingFilter, dedup: bool) ->
 /// Explicit separate files are required; producer groups positions and mirrors before splitting.
 fn load_positions(paths: &[String], base_hc: bool, filter: TrainingFilter) -> (Data, usize) {
     assert_eq!(paths.len(), 2, "--positions requires train.tsv and validation.tsv");
-    let mut d = Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![] };
+    let mut d = Data { fa: vec![], fb: vec![], off: vec![0], mat: vec![], hc: vec![], score: vec![], res: vec![], bk: vec![] };
     let mut seen = HashSet::new();
     let mut tmp = Vec::with_capacity(64);
     let mut val_start = 0;
@@ -192,9 +196,9 @@ impl Grad {
         Grad {
             w1: if full { vec![0.0; W1_ROWS * H] } else { vec![] },
             b1: vec![0.0; H],
-            w2: vec![0.0; L2 * 2 * H],
-            b2: vec![0.0; L2],
-            w3: vec![0.0; L2],
+            w2: vec![0.0; NB * L2 * 2 * H],
+            b2: vec![0.0; NB * L2],
+            w3: vec![0.0; NB * L2],
             b3: 0.0,
         }
     }
@@ -202,9 +206,9 @@ impl Grad {
         Grad {
             w1: vec![0.0; W1_ROWS * H],
             b1: vec![0.0; H],
-            w2: vec![0.0; L2 * 2 * H],
-            b2: vec![0.0; L2],
-            w3: vec![0.0; L2],
+            w2: vec![0.0; NB * L2 * 2 * H],
+            b2: vec![0.0; NB * L2],
+            w3: vec![0.0; NB * L2],
             b3: 0.0,
         }
     }
@@ -274,17 +278,18 @@ fn forward(net: &Network, d: &Data, i: usize, flip: bool) -> Fwd {
     let mut z2 = [0f32; L2];
     let mut h = [0f32; L2];
     let mut out = net.b3;
+    let o = d.bk[i] as usize * L2;
     for j in 0..L2 {
-        let row = &net.w2[j * 2 * H..(j + 1) * 2 * H];
+        let row = &net.w2[(o + j) * 2 * H..(o + j + 1) * 2 * H];
         let mut s = [0f32; 8];
         for (cr, cx) in row.chunks_exact(8).zip(x.chunks_exact(8)) {
             for k in 0..8 {
                 s[k] += cr[k] * cx[k];
             }
         }
-        z2[j] = net.b2[j] + s.iter().sum::<f32>();
+        z2[j] = net.b2[o + j] + s.iter().sum::<f32>();
         h[j] = z2[j].clamp(0.0, 1.0);
-        out += net.w3[j] * h[j];
+        out += net.w3[o + j] * h[j];
     }
     Fwd { a, x, z2, h, out }
 }
@@ -329,14 +334,16 @@ fn sample_grad_core(net: &Network, d: &Data, i: usize, k: f32, teacher_k: f32, l
     let g_out = (p - y) / k * OUT_SCALE;
     g.b3 += g_out;
     let mut gx = [0f32; 2 * H];
+    let o = d.bk[i] as usize * L2;
     for j in 0..L2 {
-        g.w3[j] += g_out * f.h[j];
-        let gh = g_out * net.w3[j];
+        let oj = o + j;
+        g.w3[oj] += g_out * f.h[j];
+        let gh = g_out * net.w3[oj];
         let gz = if f.z2[j] > 0.0 && f.z2[j] < 1.0 { gh } else { 0.0 };
         if gz != 0.0 {
-            g.b2[j] += gz;
-            let wrow = &net.w2[j * 2 * H..(j + 1) * 2 * H];
-            let grow = &mut g.w2[j * 2 * H..(j + 1) * 2 * H];
+            g.b2[oj] += gz;
+            let wrow = &net.w2[oj * 2 * H..(oj + 1) * 2 * H];
+            let grow = &mut g.w2[oj * 2 * H..(oj + 1) * 2 * H];
             for q in 0..2 * H {
                 grow[q] += gz * f.x[q];
                 gx[q] += gz * wrow[q];
@@ -557,8 +564,8 @@ struct PsvConfig {
 impl PsvConfig {
     /// 再開のときに一致が必要な値（学習の結果を変えるもの）
     fn signature(&self) -> String {
-        format!("H={} L2={} n_train={} chunk={} val_max={} val_every={} epochs={} batch={} lr={} lam={} k={} teacher_k={} mirror={} threads={}",
-            H, L2, self.n_train, self.chunk, self.val_max, self.val_every, self.epochs, self.batch,
+        format!("H={} L2={} NB={} n_train={} chunk={} val_max={} val_every={} epochs={} batch={} lr={} lam={} k={} teacher_k={} mirror={} threads={}",
+            H, L2, NB, self.n_train, self.chunk, self.val_max, self.val_every, self.epochs, self.batch,
             self.lr0.to_bits(), self.lam.to_bits(), self.k.to_bits(), self.teacher_k.to_bits(), self.mirror, self.threads)
     }
 }
@@ -835,12 +842,14 @@ fn main() {
     let mut positions = false;
     let mut thread_limit: Option<usize> = None;
     let (mut psv_mode, mut resume) = (false, false);
+    let mut bucket_stats = false;
     let (mut chunk, mut val_max, mut val_every, mut train_limit) = (2_000_000usize, 1_000_000usize, 5usize, None::<u64>);
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--psv" => { psv_mode = true; i += 1; }
             "--resume" => { resume = true; i += 1; }
+            "--bucket-stats" => { bucket_stats = true; i += 1; }
             "--chunk" => { chunk = args[i + 1].parse().unwrap(); assert!(chunk > 0); i += 2; }
             "--val-max" => { val_max = args[i + 1].parse().unwrap(); i += 2; }
             "--val-every" => { val_every = args[i + 1].parse().unwrap(); assert!(val_every > 0); i += 2; }
@@ -902,6 +911,24 @@ fn main() {
             threads: thread_limit.unwrap_or_else(|| thread::available_parallelism().map(|v| v.get()).unwrap_or(4).min(16)),
         };
         println!("学習データ（psv_prepare で静かな局面に絞り済み）: {} / {}", cfg.train, cfg.val);
+        if bucket_stats {
+            // 実験 LS：学習データの盤上の駒の数の分布（組の境目を決めるため）。ファイルの先頭・中ほど・終わりから 100万局面ずつ
+            let mut hist = [0u64; 41];
+            for start in [0, cfg.n_train / 2, cfg.n_train.saturating_sub(1_000_000)] {
+                let recs = read_records(&cfg.train, start, (1_000_000u64.min(cfg.n_train - start)) as usize);
+                for rec in recs.chunks_exact(RECORD_BYTES) {
+                    let r = psv::decode(rec).expect("教師局面を読めません");
+                    hist[(board_count(&r.pos.board) as usize).min(40)] += 1;
+                }
+            }
+            let total: u64 = hist.iter().sum();
+            let mut acc = 0u64;
+            for (n, &c) in hist.iter().enumerate().rev() {
+                acc += c;
+                if c > 0 { println!("盤上の駒 {:2}: {:9}  多い方からの累計 {:.3}", n, c, acc as f64 / total as f64); }
+            }
+            return;
+        }
         train_psv(&out_path, &cfg, net, resume);
         return;
     }
@@ -1060,14 +1087,19 @@ mod tests {
     /// 因数分解の重みを足し込んだネット（export）の出力が、学習中のネットの出力とほぼ一致する
     #[test]
     fn export_matches_training_net() {
-        let d = random_data(2, 5);
+        let d = random_data(if NB > 1 { 40 } else { 2 }, 5);
         let mut net = for_training(Network::random(9));
         // 因数分解の行にも値を入れる（halfkp のとき）
         for (i, w) in net.w1[N_FEATS * H..].iter_mut().enumerate() { *w = ((i % 97) as f32 - 48.0) * 1e-3; }
         let e = export(&net);
         assert_eq!(e.w1.len(), N_FEATS * H);
         let mut acc = Acc::default();
-        for i in 0..d.len().min(60) {
+        if NB > 1 {
+                        // 実験 LS：0番以外の組を含め、2つ以上の組の局面があること（組ごとの重みの位置の確かめ）
+            let used: std::collections::BTreeSet<u8> = d.bk.iter().copied().collect();
+            assert!(used.len() >= 2, "テストのデータの組が足りない: {:?}", used);
+        }
+        for i in 0..d.len() {
             let f = forward(&net, &d, i, false);
             // データの特徴から、足し込んだネットでアキュムレータを作り、エンジン側の出力（forward_raw）と比べる
             for (side, persp_feats) in [(0, &d.fa), (1, &d.fb)] {
@@ -1078,6 +1110,10 @@ mod tests {
                 }
                 for q in 0..H { assert!((acc.v[side][q] - f.a[side][q]).abs() < 1e-4); }
             }
+            // 組の番号に合う盤上の駒の数（実験 LS。組が1つなら何でもよい）
+            let k = d.bk[i] as usize;
+            acc.npc = if k == 0 { 40 } else { LS_T[k - 1] - 1 };
+            assert_eq!(bucket_of(acc.npc), k);
             assert!((e.forward_raw(&acc, 0) - f.out).abs() < 1e-4);
         }
     }
