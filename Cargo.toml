@@ -24,9 +24,9 @@ panic = "abort"
 # h_bonus2（11/3）と t_bucket（11/4）は一度既定にしたが、11/6 に外した。両方入れた版は 3.1 に、AobaNNUE 相手 各800局で −1.3ポイント、自分同士 800局で 49.6%（baseline/compare31_20261104/PLAN.md）。
 # time_bank（段階5の案A：AobaNNUE 相手、60秒＋2秒、Ponder あり、各800局で +3.8ポイント）は 11/7 に既定にしたが、11/10 に外した。
 # Ponder なしで 3.1 と指すと中盤に時間を使いすぎ、121手目以降の1手が 3.1 の約8割になった（time_bank だけ 対 3.1 は 200局で 46.5%。baseline/release_check_20261107/PLAN.md）。
-# 11/7 から l2_64 も既定（段階6の L64H：第2層を 64 に、土台は手作りの評価。AobaNNUE 相手 800局で +5.6ポイント。nets/default.nn も L64H に）。
-# B5 までのネット（L2=32）を使うときは l2_64 を外す（net_b4・net_b5・net_nh は --no-default-features で、残す機能を付けて組み立てる）。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "l2_64"]
+# l2_64（段階6の L64H：第2層を 64 に、土台は手作りの評価。AobaNNUE 相手 800局で +5.6ポイント）は 11/7 に既定にしたが、11/10 に外し、nets/default.nn も B5 に戻した。
+# 3.1 と1スレッド・1手1秒で800局指して 46.9%（baseline/l64h_vs31_20261110/PLAN.md）。L64H を使うときは net_l64h を付ける。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
