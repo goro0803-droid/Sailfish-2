@@ -131,6 +131,11 @@ fn drop_attacks(pos: &Position, c: usize, pt: usize, sq: usize) -> (bool, bool) 
     (check, threat)
 }
 
+/// 実験 F1（f_lmr）：省く子の局面の深さの上限と、幅（手で良くなるとみなす分＋1手あたり。1手あたりは RFP の幅と同じ 150）
+const FL_MAX_DEPTH: i32 = if cfg!(feature = "f_lmr4") { 4 } else { 3 };
+const FL_BASE: i32 = if cfg!(feature = "f_lmr4") { 100 } else { 150 };
+const FL_PER: i32 = 150;
+
 /// 段階3：駒打ちの並べ方で、王手・駒をねらう打ちに足す点数
 const DROP_BONUS: i32 = 1000;
 
@@ -314,6 +319,8 @@ pub struct Searcher {
     accs: Vec<Acc>,
     /// 各 ply の局面に至った手と、そのとき取った駒（アキュムレータの更新待ち）
     pend: Vec<(Move, u8)>,
+    /// 実験 速さ6 V25（cargo の機能 v_accpf）：各 ply の局面に至った手で足し引きする行の一覧（指した直後に作り、行を先読みさせておく）
+    pend_ops: Vec<nn::AccOps>,
     root_excluded: Vec<Move>,
     root_goal_moves: Vec<Move>,
     iteration_depth: i32,
@@ -642,6 +649,7 @@ impl Searcher {
             nn: None,
             accs: Vec::new(),
             pend: Vec::new(),
+            pend_ops: Vec::new(),
             root_excluded: Vec::new(),
             root_goal_moves: Vec::new(),
             iteration_depth: 0,
@@ -713,6 +721,17 @@ impl Searcher {
             let base = self.cached_base_eval(pos);
             return self.nn.as_ref().unwrap().forward_with_base(&self.accs[ply], pos.side, base);
         }
+        // 実験 速さ6（11/14）：V12 の覚え書きを、土台が駒の損得だけのネット（NH など）でも使う（整数のネットは同じ局面なら同じ値）
+        if self.ecache_net != 0 && self.feat & F_ECACHE != 0 {
+            let i = pos.key as usize & ((1 << ECACHE_BITS) - 1);
+            let e = self.ecache[i];
+            if e.0 == pos.key && e.1 != i32::MIN {
+                return e.1;
+            }
+            let v = self.nn.as_ref().unwrap().forward(&self.accs[ply], pos);
+            self.ecache[i] = (pos.key, v);
+            return v;
+        }
         if let Some(nn) = &self.nn {
             return nn.forward(&self.accs[ply], pos);
         }
@@ -763,10 +782,13 @@ impl Searcher {
         if nn.is_some() && self.accs.len() != MAX_PLY + 2 {
             self.accs = vec![Acc::default(); MAX_PLY + 2];
             self.pend = vec![(MOVE_NONE, 0); MAX_PLY + 2];
+            if cfg!(feature = "v_accpf") {
+                self.pend_ops = vec![nn::AccOps::default(); MAX_PLY + 2];
+            }
         }
         // 実験 速さ3 V12：ecache に入れる値の種類（土台評価か、このネットの最終の値か）が変わったら消す
         let net_id = match &nn {
-            Some(n) if cfg!(feature = "v_fcache") && n.q.is_some() && n.base_hc => Arc::as_ptr(n) as usize,
+            Some(n) if cfg!(feature = "v_fcache") && n.q.is_some() => Arc::as_ptr(n) as usize,
             _ => 0,
         };
         if net_id != self.ecache_net {
@@ -784,6 +806,22 @@ impl Searcher {
         if self.nn.is_some() {
             let cap = if mv_is_drop(m) { 0 } else { pos.board[mv_to(m)] };
             self.pend[ply + 1] = (m, cap);
+        }
+    }
+
+    /// 実験 速さ6（指した直後に呼ぶ。pos は指したあとの局面）：
+    /// V25 `v_accpf` 子の局面のアキュムレータの更新に使う行の一覧を作り、行を先読みさせる／V26 `v_ttpf` 子の局面の置換表の欄を先読みさせる。
+    /// どちらも計算の中身は変えない（読みは同じ）
+    #[inline]
+    fn after_move(&mut self, pos: &Position, ply: usize) {
+        if cfg!(feature = "v_ttpf") {
+            self.tt.prefetch(pos.key);
+        }
+        if cfg!(feature = "v_accpf") {
+            if let Some(nn) = &self.nn {
+                let (m, cap) = self.pend[ply + 1];
+                self.pend_ops[ply + 1] = nn.prepare_ops(pos, m, cap);
+            }
         }
     }
 
@@ -811,6 +849,8 @@ impl Searcher {
             let (a, b) = self.accs.split_at_mut(ply);
             if m == MOVE_NONE {
                 b[0].copy_from(&a[ply - 1], nn.q.is_some());
+            } else if cfg!(feature = "v_accpf") && self.pend_ops[ply].kind == nn::ACC_OPS_DIFF {
+                nn.apply_ops(&a[ply - 1], &self.pend_ops[ply], &mut b[0]);
             } else {
                 nn.apply_after(&a[ply - 1], pos, m, cap, &mut b[0]);
             }
@@ -929,6 +969,8 @@ impl Searcher {
             let c = self.prof.iter().map(|x| x.take().to_string()).collect::<Vec<_>>().join(",");
             let n = self.prof_n.iter().map(|x| x.take().to_string()).collect::<Vec<_>>().join(",");
             println!("info string prof cycles {} calls {} nodes {}", c, n, self.nodes);
+            let (rn, rc) = Network::prof_refresh_take();
+            println!("info string prof2 refresh_n {} refresh_cycles {}", rn, rc);
         }
         if cfg!(feature = "tree_stats") {
             let t = std::mem::take(&mut self.ts);
@@ -1487,6 +1529,7 @@ impl Searcher {
                         let piece = if mv_is_drop(m) { make_piece(pos.side, mv_drop_pt(m)) } else { pos.board[mv_from(m)] };
                         self.set_pending(pos, m, ply);
                         if !pos.do_move_legal(m) { continue; }
+                        self.after_move(pos, ply);
                         self.ss_pm[ply] = (piece, mv_to(m));
                         if cfg!(feature = "s_sing2") { self.dext[ply + 1] = self.dext[ply]; }
                         let mut s = -self.qsearch(pos, -rbeta, -rbeta + 1, ply + 1, 0);
@@ -1725,6 +1768,25 @@ impl Searcher {
                 let lmp = self.feat & D_NO_LMP == 0 && lmp_hit(n);
                 let fut = !lmp && self.feat & D_NO_FUTILITY == 0 && depth <= tp(4) && n > 1
                     && static_eval + tp(2) + tp(3) * depth <= alpha;
+                // 実験 F1（cargo の機能 f_lmr、11/14）：深さ4以上でも、LMR で浅く読むはずの静かな手は、
+                // 「浅くした深さ dc の子の局面が静的評価だけで打ち切られる（RFP：評価 − 150×dc ≥ β）」見込みなら、指さずに省く。
+                // 手で静的評価が FL_BASE 点より良くならないとみなす。省いたときは、この局面の値の下限を評価＋幅まで上げる
+                let mut fl_value = 0;
+                let fl = cfg!(feature = "f_lmr") && !lmp && !fut && depth > tp(4) && n > 2 && {
+                    let mut r = self.lmr[(depth.min(63) as usize) * 64 + n.min(63) as usize];
+                    if self.history[piece as usize * 81 + to] > tp(12) { r -= 1; }
+                    let dc = (depth - 1 - r.clamp(0, (depth - 2).max(0))).max(1);
+                    fl_value = static_eval + FL_BASE + FL_PER * dc;
+                    dc <= FL_MAX_DEPTH && fl_value <= alpha
+                };
+                if fl && !(if cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee") { pre_check!(pre_check, pre_check_on, self, pos, m) } else { prof!(self, 5, pos.gives_check(m)) }) {
+                    if pos.is_legal_quiet(m) {
+                        legal += 1;
+                        best = best.max(fl_value);
+                        ts!(self, fut);
+                    }
+                    continue;
+                }
                 if (lmp || fut) && !(if cfg!(feature = "s_prune2") || cfg!(feature = "s_capsee") { pre_check!(pre_check, pre_check_on, self, pos, m) } else { prof!(self, 5, pos.gives_check(m)) }) {
                     if pos.is_legal_quiet(m) {
                         legal += 1;
@@ -1744,6 +1806,7 @@ impl Searcher {
             }
             legal += 1;
             self.ss_pm[ply] = (piece, to);
+            self.after_move(pos, ply);
             let gives_check = pos.in_check();
             // 実験S1：損をしない王手（SEE が 0 以上）を1手延長する。延長はルートの深さの2倍の ply まで。
             // SEE は指す前の局面で調べるので、王手のときだけ戻して調べ、指し直す（実験 V6）
@@ -2164,6 +2227,7 @@ impl Searcher {
             }
             legal += 1;
             self.ss_pm[ply] = (piece, mv_to(m));
+            self.after_move(pos, ply);
             if in_check { ts!(self, qs_evasions); } else {
                 ts!(self, qs_moves);
                 if legal == 3 { ts!(self, qs_over2); }

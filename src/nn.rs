@@ -174,6 +174,37 @@ pub fn mirror_feature(f: usize) -> usize {
         KR_BASE + blk * KR_BLOCK + cls * KR_OFFS + (KR_W - 1 - dx) * KR_W + dy
     }
 }
+
+/// 実験 速さ6 V28（cargo の機能 v_kinginc）：玉が動いた手も差分で更新できる（kp だけ）
+pub const KING_INC: bool = true;
+
+/// V28：手番 us の玉が old_k から new_k へ動いたとき、視点 persp で変わる「その玉からの相対位置」の行を out に足す。
+/// board は指したあとの盤（取られた駒は載っていない）。駒ごとに、前の位置関係の行を引く（plus_bit なし）→ 新しい位置関係の行を足す（plus_bit つき）の順に並べる
+pub fn king_move_ops(board: &[u8; 81], persp: usize, us: usize, old_k: usize, new_k: usize, out: &mut [u32], n: &mut usize, plus_bit: u32) {
+    let eref = persp != us;
+    let (of, or) = ((old_k / 9) as i32, (old_k % 9) as i32);
+    let (nf, nr) = ((new_k / 9) as i32, (new_k % 9) as i32);
+    let (f0, f1) = ((of.min(nf) - KR_R).max(0), (of.max(nf) + KR_R).min(8));
+    let (r0, r1) = ((or.min(nr) - KR_R).max(0), (or.max(nr) + KR_R).min(8));
+    for f in f0..=f1 {
+        for r in r0..=r1 {
+            let s = (f * 9 + r) as usize;
+            let p = board[s];
+            if p == 0 || type_of(p) == KING {
+                continue;
+            }
+            let (c, t) = (color_of(p), type_of(p));
+            if let Some(x) = kr_feat(persp, c, t, s, old_k, eref) {
+                out[*n] = x as u32;
+                *n += 1;
+            }
+            if let Some(x) = kr_feat(persp, c, t, s, new_k, eref) {
+                out[*n] = x as u32 | plus_bit;
+                *n += 1;
+            }
+        }
+    }
+}
 } // mod kp
 
 /// HalfKP 型（実験C2）：視点ごとに「その視点の玉の升 × 駒」。強い将棋ソフトの HalfKP と同じ考え方。
@@ -229,6 +260,10 @@ pub fn mirror_feature(f: usize) -> usize {
     let p = if p < N_BOARD { p / 81 * 81 + mirror_sq(p % 81) } else { p };
     mirror_sq(k) * N_P + p
 }
+
+/// V28：HalfKP 型は玉が動くと全部の特徴が変わるので、差分にしない
+pub const KING_INC: bool = false;
+pub fn king_move_ops(_board: &[u8; 81], _persp: usize, _us: usize, _old_k: usize, _new_k: usize, _out: &mut [u32], _n: &mut usize, _plus_bit: u32) {}
 } // mod hkp
 
 /// 因数分解の特徴の左右反転（玉の位置によらない駒の特徴 0..N_FACTOR）
@@ -439,6 +474,91 @@ unsafe fn q_apply_avx2(q: &QNet, src: &[i16; H], dst: &mut [i16; H], ops: &[(usi
     }
 }
 
+/// 実験 速さ6 V25（cargo の機能 v_accpf）：差分更新で足し引きする行の一覧（視点ごと）。指した直後に作って控えておく
+#[derive(Clone, Copy)]
+pub struct AccOps {
+    /// ACC_OPS_DIFF なら一覧で更新する。ACC_OPS_OTHER なら今までの道（玉が動いた手の作り直し、整数でないネット）
+    pub kind: u8,
+    pub n: [u8; 2],
+    /// 特徴番号。ACC_OPS_PLUS のビットが立っていれば足す、なければ引く
+    pub f: [[u32; ACC_OPS_MAX]; 2],
+    /// 駒割りと、盤上の駒の数の変化
+    pub mat: i32,
+    pub npc: i8,
+}
+pub const ACC_OPS_OTHER: u8 = 0;
+pub const ACC_OPS_DIFF: u8 = 1;
+/// 1つの視点で変わる行の数の上限（動かした駒 3・置いた駒 3・取った駒 3・持ち駒 1）
+pub const ACC_OPS_MAX: usize = 10;
+const ACC_OPS_PLUS: u32 = 1 << 31;
+/// V28：玉が動いた手で、1つの視点で変わる行の数の上限（玉以外の駒 38 × 2・玉の升 2・取った駒 3・持ち駒 1）
+const KING_OPS_MAX: usize = 96;
+/// 1行のうち先読みさせる大きさ（バイト）。行は H×2 バイト
+const ACC_PF_BYTES: usize = if cfg!(feature = "v_accpf_pf2") { 128 } else { 512 };
+
+impl Default for AccOps {
+    fn default() -> Self {
+        AccOps { kind: ACC_OPS_OTHER, n: [0; 2], f: [[0; ACC_OPS_MAX]; 2], mat: 0, npc: 0 }
+    }
+}
+
+/// V25：指す前のアキュムレータ src に、ops の行を順に足し引きして dst に書く。
+/// 要素ごとの飽和演算の順番は1行ずつのときと同じなので、値も同じ
+#[inline]
+fn q_apply_ops(q: &QNet, src: &[i16; H], dst: &mut [i16; H], ops: &[u32]) {
+    #[cfg(target_arch = "x86_64")]
+    if !cfg!(feature = "v_accpf_rows") && H % 128 == 0 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: AVX2 の有無を実行時に確かめた。H は 128 の倍数で、特徴番号は w1 の範囲内。
+        unsafe { q_apply_ops_avx2(q, src, dst, ops) };
+        return;
+    }
+    q_apply_ops_rows(q, src, dst, ops);
+}
+
+/// `q_apply_ops` の、1行ずつ足し引きする道（AVX2 のない CPU と、切り分け用の v_accpf_rows）。値は同じ
+fn q_apply_ops_rows(q: &QNet, src: &[i16; H], dst: &mut [i16; H], ops: &[u32]) {
+    *dst = *src;
+    for &op in ops {
+        if cfg!(feature = "v_accpf_rows") {
+            q_update(dst, q.row((op & !ACC_OPS_PLUS) as usize), op & ACC_OPS_PLUS != 0);
+            continue;
+        }
+        q_update_scalar(dst, q.row((op & !ACC_OPS_PLUS) as usize), op & ACC_OPS_PLUS != 0);
+    }
+}
+
+/// レジスタ8本（128要素）ずつ載せて、全部の行を足し引きしてから書く。行は先頭から順に読む
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn q_apply_ops_avx2(q: &QNet, src: &[i16; H], dst: &mut [i16; H], ops: &[u32]) {
+    use std::arch::x86_64::*;
+    const T: usize = 8;
+    let w = q.w1.as_ptr();
+    let mut i = 0;
+    while i < H {
+        let mut r = [_mm256_setzero_si256(); T];
+        for k in 0..T {
+            r[k] = _mm256_loadu_si256(src.as_ptr().add(i + 16 * k) as *const __m256i);
+        }
+        for &op in ops {
+            let row = w.add((op & !ACC_OPS_PLUS) as usize * H + i);
+            if op & ACC_OPS_PLUS != 0 {
+                for k in 0..T {
+                    r[k] = _mm256_adds_epi16(r[k], _mm256_loadu_si256(row.add(16 * k) as *const __m256i));
+                }
+            } else {
+                for k in 0..T {
+                    r[k] = _mm256_subs_epi16(r[k], _mm256_loadu_si256(row.add(16 * k) as *const __m256i));
+                }
+            }
+        }
+        for k in 0..T {
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i + 16 * k) as *mut __m256i, r[k]);
+        }
+        i += 16 * T;
+    }
+}
+
 /// V13：盤上の駒1つの特徴を、視点ごとの足し引きの並びに加える（`Network::piece` と同じ順番）
 #[inline]
 fn push_piece_ops(ops: &mut [[(usize, bool); 12]; 2], n: &mut [usize; 2], plus: bool, color: usize, pt: u8, sq: usize, kings: [usize; 2]) {
@@ -551,6 +671,10 @@ unsafe fn forward_q_avx2(q: &QNet, acc: &Acc, stm: usize) -> f32 {
     }
     out
 }
+
+/// 診断（cargo の機能 prof）：玉が動いたときの作り直しの回数とクロック数
+static PROF_REFRESH_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_REFRESH_TSC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct Network {
@@ -677,6 +801,12 @@ impl Network {
         self.refresh_arrays(&pos.board, &pos.hand, pos.king, acc);
     }
 
+    /// 診断（cargo の機能 prof）：作り直しの回数とクロック数を読み出して 0 に戻す
+    pub fn prof_refresh_take() -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (PROF_REFRESH_N.swap(0, Relaxed), PROF_REFRESH_TSC.swap(0, Relaxed))
+    }
+
     #[inline]
     fn add(&self, acc: &mut Acc, persp: usize, f: usize) {
         if let Some(q) = &self.q {
@@ -725,7 +855,19 @@ impl Network {
         let dst = mv_to(m);
         // 玉が動くと、玉からの相対位置の特徴がすべて変わるので、作り直す（玉の移動は少ない）
         if !mv_is_drop(m) && type_of(pos.board[dst]) == KING {
-            self.refresh_arrays(&pos.board, &pos.hand, pos.king, to);
+            #[cfg(all(feature = "prof", target_arch = "x86_64"))]
+            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+            match &self.q {
+                // 実験 速さ6 V28（cargo の機能 v_kinginc）：玉が動いた手も、変わる行だけ足し引きする
+                Some(q) if cfg!(feature = "v_kinginc") && KING_INC => Self::apply_king_move(q, from, pos, m, cap, to),
+                _ => self.refresh_arrays(&pos.board, &pos.hand, pos.king, to),
+            }
+            #[cfg(all(feature = "prof", target_arch = "x86_64"))]
+            {
+                use std::sync::atomic::Ordering::Relaxed;
+                PROF_REFRESH_N.fetch_add(1, Relaxed);
+                PROF_REFRESH_TSC.fetch_add(unsafe { core::arch::x86_64::_rdtsc() } - t0, Relaxed);
+            }
             return;
         }
         if cfg!(feature = "v_accfuse") {
@@ -735,6 +877,51 @@ impl Network {
             }
         }
         self.apply_after_rows(from, pos, m, cap, to);
+    }
+
+    /// V28：玉が動いた手 m の差分更新（pos は指したあとの局面、cap は取った駒）。
+    /// 変わるのは、玉の升の行、動いた玉からの相対位置の行（前後の玉の周りの駒の分）、取った駒の行と持ち駒の行だけ。
+    /// 足し引きの途中で値が大きく振れないよう、駒ごとに「引く → 足す」の順に並べる（飽和が起きなければ、作り直しと同じ値になる）
+    fn apply_king_move(q: &QNet, from: &Acc, pos: &Position, m: Move, cap: u8, to: &mut Acc) {
+        let us = pos.side ^ 1;
+        let (src, dst) = (mv_from(m), mv_to(m));
+        let kings = pos.king;
+        let mut old_kings = kings;
+        old_kings[us] = src;
+        let mut f = [0usize; 3];
+        for persp in 0..2 {
+            let mut ops = [0u32; KING_OPS_MAX];
+            let mut n = 0;
+            if cap != 0 {
+                // 取った駒に付いていた行（指す前の玉の位置で）を引く
+                let k = piece_feats(persp, color_of(cap), type_of(cap), dst, old_kings, &mut f);
+                for &i in &f[..k] {
+                    ops[n] = i as u32;
+                    n += 1;
+                }
+            }
+            piece_feats(persp, us, KING, src, old_kings, &mut f);
+            ops[n] = f[0] as u32;
+            piece_feats(persp, us, KING, dst, kings, &mut f);
+            ops[n + 1] = f[0] as u32 | ACC_OPS_PLUS;
+            n += 2;
+            king_move_ops(&pos.board, persp, us, src, dst, &mut ops, &mut n, ACC_OPS_PLUS);
+            if cap != 0 {
+                let hpt = unpromote(type_of(cap));
+                let k = (pos.hand[us][hpt as usize] as usize).min(HAND_CAP[hpt as usize]);
+                ops[n] = hand_feat(persp, us, hpt, k, kings) as u32 | ACC_OPS_PLUS;
+                n += 1;
+            }
+            q_apply_ops(q, &from.q[persp], &mut to.q[persp], &ops[..n]);
+        }
+        to.mat = from.mat;
+        to.npc = from.npc;
+        if cap != 0 {
+            let cpt = type_of(cap);
+            let sign = if us == BLACK { 1 } else { -1 };
+            to.mat += sign * (HAND_VALUE[unpromote(cpt) as usize] + PIECE_VALUE[cpt as usize]);
+            to.npc -= 1;
+        }
     }
 
     /// 差分更新を1行ずつ行う（玉が動いた手は呼ぶ前に除く）。V13 の比べる相手としてテストでも使う
@@ -822,6 +1009,94 @@ impl Network {
         }
         to.mat = mat;
         to.npc = npc;
+    }
+
+    /// 実験 速さ6 V25（cargo の機能 v_accpf）：手 m を指したあとの局面 pos から、差分更新で足し引きする行の一覧を作る。
+    /// 作りながら行を先読みさせる（子の局面で評価が要るまでの間に、行がキャッシュに届く）。
+    /// 一覧の順番は `apply_after_rows` と同じ（視点ごとに、動かした駒を引く → 置いた駒を足す → 取った駒を引く → 持ち駒を足す）
+    #[inline]
+    pub fn prepare_ops(&self, pos: &Position, m: Move, cap: u8) -> AccOps {
+        let mut o = AccOps { kind: ACC_OPS_OTHER, n: [0; 2], f: [[0; ACC_OPS_MAX]; 2], mat: 0, npc: 0 };
+        let dst = mv_to(m);
+        // 玉が動いた手は作り直し、整数でないネットは今までの道で更新する
+        if !mv_is_drop(m) && type_of(pos.board[dst]) == KING {
+            return o;
+        }
+        let Some(q) = &self.q else { return o };
+        o.kind = ACC_OPS_DIFF;
+        let us = pos.side ^ 1;
+        let kings = pos.king;
+        let sign = if us == BLACK { 1 } else { -1 };
+        let push = |o: &mut AccOps, persp: usize, f: usize, plus: bool| {
+            o.f[persp][o.n[persp] as usize] = f as u32 | if plus { ACC_OPS_PLUS } else { 0 };
+            o.n[persp] += 1;
+        };
+        let piece = |o: &mut AccOps, plus: bool, color: usize, pt: u8, sq: usize| {
+            let mut f = [0usize; 3];
+            for persp in 0..2 {
+                let k = piece_feats(persp, color, pt, sq, kings, &mut f);
+                for &i in &f[..k] {
+                    o.f[persp][o.n[persp] as usize] = i as u32 | if plus { ACC_OPS_PLUS } else { 0 };
+                    o.n[persp] += 1;
+                }
+            }
+        };
+        if mv_is_drop(m) {
+            let pt = mv_drop_pt(m);
+            let before = (pos.hand[us][pt as usize] as usize + 1).min(HAND_CAP[pt as usize]);
+            for persp in 0..2 {
+                push(&mut o, persp, hand_feat(persp, us, pt, before, kings), false);
+            }
+            piece(&mut o, true, us, pt, dst);
+            o.mat = sign * (PIECE_VALUE[pt as usize] - HAND_VALUE[pt as usize]);
+            o.npc = 1;
+        } else {
+            let src = mv_from(m);
+            let npt = type_of(pos.board[dst]);
+            let pt = if mv_is_promo(m) { npt - PROMOTE } else { npt };
+            piece(&mut o, false, us, pt, src);
+            piece(&mut o, true, us, npt, dst);
+            o.mat = sign * (PIECE_VALUE[npt as usize] - PIECE_VALUE[pt as usize]);
+            if cap != 0 {
+                let cpt = type_of(cap);
+                piece(&mut o, false, color_of(cap), cpt, dst);
+                let hpt = unpromote(cpt);
+                let k = (pos.hand[us][hpt as usize] as usize).min(HAND_CAP[hpt as usize]);
+                for persp in 0..2 {
+                    push(&mut o, persp, hand_feat(persp, us, hpt, k, kings), true);
+                }
+                o.mat += sign * (HAND_VALUE[hpt as usize] + PIECE_VALUE[cpt as usize]);
+                o.npc = -1;
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", not(feature = "v_accpf_nopf")))]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let w = q.w1.as_ptr() as *const i8;
+            for persp in 0..2 {
+                for &op in &o.f[persp][..o.n[persp] as usize] {
+                    let base = (op & !ACC_OPS_PLUS) as usize * H * 2;
+                    let mut off = 0;
+                    while off < ACC_PF_BYTES.min(H * 2) {
+                        // SAFETY: 先読みは番地を読まない（範囲の外でも害はない）。特徴番号は w1 の範囲内
+                        unsafe { _mm_prefetch(w.add(base + off), _MM_HINT_T0) };
+                        off += 64;
+                    }
+                }
+            }
+        }
+        o
+    }
+
+    /// V25：控えておいた行の一覧で、指す前のアキュムレータ from から指したあとのアキュムレータ to を作る（`kind` が差分のときだけ呼ぶ）
+    #[inline]
+    pub fn apply_ops(&self, from: &Acc, ops: &AccOps, to: &mut Acc) {
+        let q = self.q.as_ref().expect("apply_ops は整数のネットだけ");
+        for persp in 0..2 {
+            q_apply_ops(q, &from.q[persp], &mut to.q[persp], &ops.f[persp][..ops.n[persp] as usize]);
+        }
+        to.mat = from.mat + ops.mat;
+        to.npc = (from.npc as i8 + ops.npc) as u8;
     }
 
     /// ネットワークの出力（土台を足す前、-1〜1 くらいの値）
@@ -1350,6 +1625,59 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// 実験 速さ6 V25・V28：控えた行の一覧での更新と、玉が動いた手の差分更新は、作り直しと同じ値になる
+    #[test]
+    fn ops_and_king_incremental_match_refresh() {
+        for mut net in test_nets(9) {
+            net.set_quant(true);
+            let q = net.q.as_ref().unwrap();
+            let mut rng = 20261114u64;
+            let (mut kings, mut others) = (0, 0);
+            for _game in 0..40 {
+                let mut pos = Position::startpos();
+                let mut acc = Acc::default();
+                net.refresh(&pos, &mut acc);
+                for _ in 0..250 {
+                    let moves = pos.legal_moves();
+                    if moves.is_empty() { break; }
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    // 玉の手をよく選ぶ（3回に1回は、玉の手があればその中から）
+                    let km: Vec<Move> = moves.iter().copied().filter(|&m| !mv_is_drop(m) && type_of(pos.board[mv_from(m)]) == KING).collect();
+                    let m = if rng % 3 == 0 && !km.is_empty() { km[((rng >> 8) % km.len() as u64) as usize] } else { moves[((rng >> 8) % moves.len() as u64) as usize] };
+                    let cap = if mv_is_drop(m) { 0 } else { pos.board[mv_to(m)] };
+                    pos.do_move(m);
+                    let mut fresh = Acc::default();
+                    net.refresh(&pos, &mut fresh);
+                    let mut next = Acc::default();
+                    if !mv_is_drop(m) && type_of(pos.board[mv_to(m)]) == KING {
+                        if KING_INC {
+                            Network::apply_king_move(q, &acc, &pos, m, cap, &mut next);
+                            assert_eq!(next.q, fresh.q, "玉が動いた手の差分更新が作り直しと合わない");
+                            assert_eq!((next.mat, next.npc), (fresh.mat, fresh.npc));
+                            kings += 1;
+                        }
+                    } else {
+                        let ops = net.prepare_ops(&pos, m, cap);
+                        assert_eq!(ops.kind, ACC_OPS_DIFF);
+                        net.apply_ops(&acc, &ops, &mut next);
+                        assert_eq!(next.q, fresh.q, "行の一覧での更新が作り直しと合わない");
+                        for persp in 0..2 {
+                            let mut rows = [0i16; H];
+                            q_apply_ops_rows(q, &acc.q[persp], &mut rows, &ops.f[persp][..ops.n[persp] as usize]);
+                            assert_eq!(rows, next.q[persp], "1行ずつの道（AVX2 のない CPU）が合わない");
+                        }
+                        assert_eq!((next.mat, next.npc), (fresh.mat, fresh.npc));
+                        others += 1;
+                    }
+                    acc = fresh;
+                }
+            }
+            assert!(others > 1000 && (!KING_INC || kings > 300), "確かめた手が少ない（玉 {}、ほか {}）", kings, others);
         }
     }
 

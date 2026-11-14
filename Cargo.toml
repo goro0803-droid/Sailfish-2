@@ -26,7 +26,9 @@ panic = "abort"
 # Ponder なしで 3.1 と指すと中盤に時間を使いすぎ、121手目以降の1手が 3.1 の約8割になった（time_bank だけ 対 3.1 は 200局で 46.5%。baseline/release_check_20261107/PLAN.md）。
 # l2_64（段階6の L64H：第2層を 64 に、土台は手作りの評価。AobaNNUE 相手 800局で +5.6ポイント）は 11/7 に既定にしたが、11/10 に外し、nets/default.nn も B5 に戻した。
 # 3.1 と1スレッド・1手1秒で800局指して 46.9%（baseline/l64h_vs31_20261110/PLAN.md）。L64H を使うときは net_l64h を付ける。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen"]
+# 11/14 から、実験 速さ6 の v_ttpf・v_rep2・v_kinginc と、測り直した v_fcache（10/31 の V12）も既定（ユーザーの判断 11/14）。
+# 読みは同じで、4つ合わせて約1.15倍（baseline/fable_speed_20261114/PLAN.md）。v_accpf は4つの上で 1.010 にとどまり、既定にしない。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -151,6 +153,23 @@ v_sparse = []
 ls4 = []
 # 実験 LS：組を4つにしたネット（nets/ls4.nn）を埋め込む
 net_ls4 = ["ls4"]
+# 実験 速さ6（11/14、Fable 5.2）：どれも読みは変えない。
+# V25 差分更新で足し引きする行の一覧を指した直後に作って行を先読みさせ、子の局面ではその一覧でレジスタに載せたまま更新する
+v_accpf = []
+# V25 の切り分け用：rows 1行ずつ更新する／nopf 先読みしない／pf2 行の先頭 128 バイトだけ先読みする
+v_accpf_rows = ["v_accpf"]
+v_accpf_nopf = ["v_accpf"]
+v_accpf_pf2 = ["v_accpf"]
+# V28 玉が動いた手も、作り直さずに変わる行だけ足し引きする（作り直しは更新の 10.5% だが、更新の時間の 44% を占めていた）
+v_kinginc = []
+# V26 指した直後に、子の局面の置換表の欄を先読みさせる
+v_ttpf = []
+# V27 千日手の調べを、2手おきに・いちばん新しいヌルムーブの後だけにする
+v_rep2 = []
+# 実験 F1（11/14、Fable 5.2）：深さ4以上で、LMR で浅く読むはずの静かな手を、子の局面が静的評価だけで打ち切られる見込みなら指さずに省く
+# （子の深さ3まで、幅 150＋150×子の深さ）。f_lmr4 は広げた版（子の深さ4まで、幅 100＋150×子の深さ）で、木の大きさの比べにだけ使う
+f_lmr = []
+f_lmr4 = ["f_lmr"]
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []

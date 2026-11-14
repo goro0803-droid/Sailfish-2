@@ -142,6 +142,19 @@ impl TT {
         if worth(db) < worth(da) { b } else { a }
     }
 
+    /// 実験 速さ6 V26（cargo の機能 v_ttpf）：局面 key の欄を先読みさせる（指した直後に呼び、子の局面で引くまでに届かせる）
+    #[inline]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // SAFETY: 先読みは番地を読まない。添字は表の範囲内
+            unsafe { _mm_prefetch(self.table.as_ptr().add(key as usize & self.mask) as *const i8, _MM_HINT_T0) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
     pub fn clear(&self) {
         for s in &self.table {
             s.key_xor.store(0, Ordering::Relaxed);

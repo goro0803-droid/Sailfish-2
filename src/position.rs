@@ -32,6 +32,8 @@ struct StateInfo {
     mv: Move, // MOVE_NONE ならヌルムーブ
     captured: u8,
     key: u64, // 指す前の局面のハッシュ
+    /// 実験 速さ6 V27（v_rep2）：この手（ヌルムーブ）の前の rep_floor（戻すときに使う。ヌルムーブ以外は 0）
+    floor: u32,
 }
 
 #[derive(Clone)]
@@ -45,6 +47,8 @@ pub struct Position {
     pub bb: [[u128; 15]; 2],
     pub occ: u128,
     history: Vec<StateInfo>,
+    /// 実験 速さ6 V27（v_rep2）：history のうち、いちばん新しいヌルムーブの次の添字（無ければ 0）。千日手はここより前を調べない
+    rep_floor: usize,
 }
 
 fn char_to_piece(ch: char) -> Option<(usize, u8)> {
@@ -82,6 +86,7 @@ impl Position {
             bb: [[0; 15]; 2],
             occ: 0,
             history: Vec::with_capacity(1024),
+            rep_floor: 0,
         };
 
         // 盤面: a段から i段へ、各段は 9筋から 1筋へ
@@ -143,7 +148,7 @@ impl Position {
         for (sq, &p) in board.iter().enumerate() {
             if p != 0 && type_of(p) == KING { king[color_of(p)] = sq; }
         }
-        let mut pos = Position { board, hand, side, king, key: 0, bb: [[0; 15]; 2], occ: 0, history: Vec::with_capacity(1024) };
+        let mut pos = Position { board, hand, side, king, key: 0, bb: [[0; 15]; 2], occ: 0, history: Vec::with_capacity(1024), rep_floor: 0 };
         pos.key = pos.compute_key();
         pos.rebuild_bb();
         pos
@@ -214,7 +219,7 @@ impl Position {
     pub fn do_move(&mut self, m: Move) {
         let us = self.side;
         let to = mv_to(m);
-        let mut st = StateInfo { mv: m, captured: 0, key: self.key };
+        let mut st = StateInfo { mv: m, captured: 0, key: self.key, floor: 0 };
         if mv_is_drop(m) {
             let pt = mv_drop_pt(m);
             self.add_hand(us, pt, -1);
@@ -270,13 +275,15 @@ impl Position {
     }
 
     pub fn do_null(&mut self) {
-        self.history.push(StateInfo { mv: MOVE_NONE, captured: 0, key: self.key });
+        self.history.push(StateInfo { mv: MOVE_NONE, captured: 0, key: self.key, floor: self.rep_floor as u32 });
+        self.rep_floor = self.history.len();
         self.side ^= 1;
         self.key ^= ZOB.side;
     }
 
     pub fn undo_null(&mut self) {
         let st = self.history.pop().unwrap();
+        self.rep_floor = st.floor as usize;
         self.side ^= 1;
         self.key = st.key;
     }
@@ -1285,6 +1292,19 @@ impl Position {
         let mut j = n;
         let mut count = 0;
         let mut len = None;
+        // 実験 速さ6 V27（cargo の機能 v_rep2）：2手おきに、いちばん新しいヌルムーブの後だけを調べる（下の調べ方と同じ結果）
+        if cfg!(feature = "v_rep2") {
+            let lo = self.rep_floor.max(n.saturating_sub(256));
+            let mut t = n;
+            while t >= lo + 2 {
+                t -= 2;
+                if self.history[t].key == self.key {
+                    len = Some(n - t);
+                    break;
+                }
+            }
+            j = 0;
+        }
         while j > 0 && count < 256 {
             j -= 1;
             count += 1;
