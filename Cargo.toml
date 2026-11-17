@@ -30,7 +30,10 @@ panic = "abort"
 # 読みは同じで、4つ合わせて約1.15倍（baseline/fable_speed_20261114/PLAN.md）。v_accpf は4つの上で 1.010 にとどまり、既定にしない。
 # 11/15 から、実験 F1 の f_lmr4（LMR で浅く読む静かな手の枝刈り）も既定（ユーザーの判断 11/15）。読みは変わる。
 # 直接対局の SPRT（10秒＋0.2秒）1,920局で 53.2%（H1）、AobaNNUE 相手・1手1秒 各800局で +3.1ポイント（baseline/fable_sprt_20261114/PLAN.md の E4・E4b）。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache", "f_lmr4"]
+# 11/18 から、実験 NS の ns（探索を作り直した版、src/search_ns.rs）も既定（ユーザーの判断 11/18）。読みは変わる。
+# 3.2 に、直接対局の SPRT（1スレッド・10秒＋0.2秒）896局で 56.3%（H1）、AobaNNUE 相手・1手1秒 各800局で +12.2ポイント、
+# 4スレッド・60秒＋2秒の SPRT 80局で 88.1%（H1）（baseline/ns_search_20261117/PLAN.md の N3・N4）。
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache", "f_lmr4", "ns"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -172,6 +175,8 @@ v_rep2 = []
 # （子の深さ3まで、幅 150＋150×子の深さ）。f_lmr4 は広げた版（子の深さ4まで、幅 100＋150×子の深さ）で、11/15 から既定
 f_lmr = []
 f_lmr4 = ["f_lmr"]
+# 実験 NS（11/17〜）：探索を作り直した版（src/search_ns.rs）。部品は USI の隠しオプション NsOff で外せる（baseline/ns_search_20261117/PLAN.md）
+ns = []
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []

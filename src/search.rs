@@ -35,6 +35,8 @@ mod node_dump {
 /// 探索の改良を個別に入れ替えるためのビット（USI の隠しオプション Feat で指定。強さの比較用）
 /// 実験S12（10/28）で singular の +1 の延長を既定で有効にした（AobaNNUE 相手 800局で +7.8ポイント）
 pub static FEAT: AtomicU32 = AtomicU32::new(F_QS_TT | F_NN | F_ECACHE | F_DELTA_HAND | F_SINGULAR);
+/// 実験 NS（cargo の機能 ns）：作り直した探索で外す部品（USI の隠しオプション NsOff。中身は search_ns.rs の NS_ の定数）
+pub static NS_OFF: AtomicU32 = AtomicU32::new(0);
 /// 静止探索でも置換表を使う
 pub const F_QS_TT: u32 = 1;
 /// 置換表に手がないとき、深さを 1 減らす（Internal Iterative Reduction）
@@ -362,6 +364,8 @@ pub struct Searcher {
     lmr: Vec<i32>,
     pv: Vec<Move>,
     pv_len: [usize; MAX_PLY + 2],
+    /// 実験 NS（cargo の機能 ns）：作り直した探索の表
+    ns: ns::NsTables,
 }
 
 const PV_STRIDE: usize = MAX_PLY + 2;
@@ -598,7 +602,21 @@ impl TacticalThreats {
     }
 }
 
+/// 実験 NS（11/17）：作り直した探索（cargo の機能 ns のときだけ使う）
+#[path = "search_ns.rs"]
+mod ns;
+
 impl Searcher {
+    /// 根の局面を読む（cargo の機能 ns なら作り直した探索、そうでなければ今までの探索）
+    #[inline]
+    fn root_search(&mut self, pos: &mut Position, alpha: i32, beta: i32, depth: i32) -> i32 {
+        if cfg!(feature = "ns") {
+            self.ns_search(pos, alpha, beta, depth, 0, false, MOVE_NONE)
+        } else {
+            self.negamax(pos, alpha, beta, depth, 0, false)
+        }
+    }
+
     /// 静止探索（全幅の窓）の値と読み筋を返す（学習データづくり用、実験B3）。
     /// 局面の手番から見た値。読み筋は pos に指さない（pos は元のまま返す）。
     pub fn qsearch_pv(&mut self, pos: &mut Position) -> (i32, Vec<Move>) {
@@ -680,6 +698,7 @@ impl Searcher {
             lmr: lmr_table(),
             pv: vec![MOVE_NONE; PV_STRIDE * PV_STRIDE],
             pv_len: [0; MAX_PLY + 2],
+            ns: ns::NsTables::new(cfg!(feature = "ns")),
         }
     }
 
@@ -1021,6 +1040,9 @@ impl Searcher {
         self.singular_extensions = 0;
         self.stopped = false;
         self.killers = [[MOVE_NONE; 2]; MAX_PLY + 2];
+        self.ns.off = NS_OFF.load(Ordering::Relaxed);
+        self.ns.nmp_min_ply = 0;
+        self.ns.dext[0] = 0;
         let is_main = self.helper_idx == 0;
         if let Some(nn) = &self.nn {
             nn.refresh(pos, &mut self.accs[0]);
@@ -1054,7 +1076,7 @@ impl Searcher {
                 (-INF, INF)
             };
             let score = loop {
-                let s = self.negamax(pos, alpha, beta, depth, 0, false);
+                let s = self.root_search(pos, alpha, beta, depth);
                 if self.stopped {
                     break s;
                 }
@@ -1093,7 +1115,7 @@ impl Searcher {
                 self.root_excluded.push(best);
                 for k in 1..self.multipv.min(root_moves.len()) {
                     self.sel_depth = 0;
-                    let s = self.negamax(pos, -INF, INF, depth, 0, false);
+                    let s = self.root_search(pos, -INF, INF, depth);
                     if self.stopped || self.pv_len[0] == 0 {
                         break;
                     }

@@ -126,6 +126,12 @@ impl Engine {
                     sailfish2::search::FEAT.store(v, std::sync::atomic::Ordering::Relaxed);
                 }
             }
+            // 実験 NS（cargo の機能 ns）：作り直した探索で外す部品（ビットの和）
+            "NsOff" => {
+                if let Ok(v) = value.parse() {
+                    sailfish2::search::NS_OFF.store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             // ニューラルネットワークの評価関数ファイル（開発用の隠しオプション。Feat に 32 を足すと使う）
             "EvalFile" => {
                 if let Err(e) = sailfish2::nn::load_global(&value) {
