@@ -344,7 +344,11 @@ impl Searcher {
 
         let in_check = pos.in_check();
         // 1手詰め（置換表に無い局面）
-        if off & NS_MATE1 == 0 && !root && !in_check && excluded == MOVE_NONE && tt_entry.is_none() {
+        // 実験 M1（cargo の機能 ns_mate1d1）：1手詰めを、残りの深さ1の局面だけで調べる
+        // 機能 ns_nomate1（11/21 既定に、実験 M1 の MA と同じ読み）：通常の探索では1手詰めを調べない
+        if !cfg!(feature = "ns_nomate1") && off & NS_MATE1 == 0 && !root && !in_check && excluded == MOVE_NONE && tt_entry.is_none()
+            && (!cfg!(feature = "ns_mate1d1") || depth <= 1)
+        {
             if let Some(m) = prof!(self, 15, pos.mate_in_one()) {
                 let s = MATE - ply as i32 - 1;
                 self.pv[ply * PV_STRIDE] = m;
@@ -438,7 +442,7 @@ impl Searcher {
                     if !self.exchange_ge(pos, m, pc_beta - raw) { continue; }
                     let piece = piece_of(pos, m);
                     self.set_pending(pos, m, ply);
-                    if !prof!(self, 3, pos.do_move_legal(m)) { continue; }
+                    if !prof!(self, 3, pos.do_move_legal_ic(m, in_check)) { continue; }
                     self.after_move(pos, ply);
                     self.ss_pm[ply] = (piece, mv_to(m));
                     let mut v = -self.ns_qsearch(pos, -pc_beta, -pc_beta + 1, ply + 1, 0);
@@ -540,7 +544,7 @@ impl Searcher {
                 && depth >= 7 && ply < (2 * self.iteration_depth) as usize
                 && tt_depth >= depth - 3 && tt_flag & BOUND_LOWER != 0 && tt_score.abs() < MATE_BOUND
             {
-                let legal = prof!(self, 3, pos.do_move_legal(m));
+                let legal = prof!(self, 3, pos.do_move_legal_ic(m, in_check));
                 if legal {
                     prof!(self, 4, pos.undo_move());
                     let sbeta = tt_score - nt(15) * depth / 10;
@@ -575,7 +579,7 @@ impl Searcher {
             self.ns.dext[ply + 1] = self.ns.dext[ply] + i32::from(ext == 2);
 
             self.set_pending(pos, m, ply);
-            if !prof!(self, 3, pos.do_move_legal(m)) {
+            if !prof!(self, 3, pos.do_move_legal_ic(m, in_check)) {
                 move_count -= 1;
                 continue;
             }
@@ -804,7 +808,7 @@ impl Searcher {
             }
             let piece = piece_of(pos, m);
             self.set_pending(pos, m, ply);
-            if !prof!(self, 3, pos.do_move_legal(m)) {
+            if !prof!(self, 3, pos.do_move_legal_ic(m, in_check)) {
                 continue;
             }
             searched += 1;

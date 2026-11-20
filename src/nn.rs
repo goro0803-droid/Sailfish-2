@@ -870,6 +870,13 @@ impl Network {
             }
             return;
         }
+        // 実験 速さ7（cargo の機能 v_accops、Gemini の分析4）：評価が要って更新するときだけ行の一覧を作り、
+        // レジスタ8本に載せたまま全部の行を足し引きして1回で書く（V25 の部品。足し引きの順番は1行ずつと同じなので値も同じ）
+        if cfg!(feature = "v_accops") && self.q.is_some() {
+            let o = self.make_ops(pos, m, cap, false);
+            self.apply_ops(from, &o, to);
+            return;
+        }
         if cfg!(feature = "v_accfuse") {
             if let Some(q) = &self.q {
                 Self::apply_after_q(q, from, pos, m, cap, to);
@@ -1016,6 +1023,12 @@ impl Network {
     /// 一覧の順番は `apply_after_rows` と同じ（視点ごとに、動かした駒を引く → 置いた駒を足す → 取った駒を引く → 持ち駒を足す）
     #[inline]
     pub fn prepare_ops(&self, pos: &Position, m: Move, cap: u8) -> AccOps {
+        self.make_ops(pos, m, cap, true)
+    }
+
+    /// `prepare_ops` の中身。pf が false なら行を先読みさせない（すぐ使うとき。実験 v_accops）
+    #[inline]
+    fn make_ops(&self, pos: &Position, m: Move, cap: u8, pf: bool) -> AccOps {
         let mut o = AccOps { kind: ACC_OPS_OTHER, n: [0; 2], f: [[0; ACC_OPS_MAX]; 2], mat: 0, npc: 0 };
         let dst = mv_to(m);
         // 玉が動いた手は作り直し、整数でないネットは今までの道で更新する
@@ -1070,7 +1083,7 @@ impl Network {
             }
         }
         #[cfg(all(target_arch = "x86_64", not(feature = "v_accpf_nopf")))]
-        {
+        if pf {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
             let w = q.w1.as_ptr() as *const i8;
             for persp in 0..2 {

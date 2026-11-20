@@ -1200,6 +1200,36 @@ impl Position {
         true
     }
 
+    /// `do_move_legal` と同じ結果。in_check は指す前に手番側が王手をかけられているか。
+    /// 実験 速さ7（cargo の機能 v_legalfast、Gemini の分析1）：王手をかけられていなければ、自玉が王手になりうるのは
+    /// 玉の手と、玉から縦・横・斜めの線上にある駒の手だけなので、それ以外の手（駒打ちを含む）は王手放置の判定を省く
+    #[inline]
+    pub fn do_move_legal_ic(&mut self, m: Move, in_check: bool) -> bool {
+        if !cfg!(feature = "v_legalfast") || in_check {
+            return self.do_move_legal(m);
+        }
+        let us = self.side;
+        let k = self.king[us];
+        if k == NO_SQ {
+            return self.do_move_legal(m);
+        }
+        if !mv_is_drop(m) {
+            let from = mv_from(m);
+            if from == k || (crate::bb::BB.rook_reach[k] | crate::bb::BB.bishop_reach[k]) >> from & 1 != 0 {
+                return self.do_move_legal(m);
+            }
+        }
+        self.do_move(m);
+        if mv_is_drop(m) && mv_drop_pt(m) == PAWN {
+            let ek = self.king[us ^ 1];
+            if ek != NO_SQ && NEIGHBOR[us][mv_to(m)][0] == ek as i8 && !self.has_legal_move() {
+                self.undo_move();
+                return false;
+            }
+        }
+        true
+    }
+
     /// 手番側に合法手があるか（打ち歩詰めの判定用。ここでは打ち歩詰め自体は無視する）
     fn has_legal_move(&mut self) -> bool {
         let mut list = MoveList::new();

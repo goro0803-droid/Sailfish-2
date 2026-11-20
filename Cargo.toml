@@ -36,7 +36,7 @@ panic = "abort"
 # 11/20 から、実験NH の net_nh（手作りの評価を使わないネット、nets/nh.nn）も既定（ユーザーの判断 11/20）。読みは変わる。
 # NS の上で、直接対局の SPRT（1スレッド・10秒＋0.2秒）2,240局で 53.0%（H1）、AobaNNUE 相手・1手1秒 各800局で +4.0ポイント、
 # 4スレッド・60秒＋2秒の SPRT 400局で 51.6%（上限、基準は通過）（baseline/ns_search_20261117/PLAN.md の N6・N8）。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache", "f_lmr4", "ns", "net_nh", "t_partial"]
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache", "f_lmr4", "ns", "net_nh", "t_partial", "ns_nomate1", "v_legalfast", "v_bbchk"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -69,6 +69,13 @@ t_unst = []
 t_fall = []
 # 実験 PI（11/20）：11/20 既定にした（直接 960局 55.1% で H1、AobaNNUE 相手 +1.8ポイント）。時間で止めた最後の反復で、読み終えて α を上回った根の手があれば、それを指す（NS の探索だけ。baseline/partial_20261120/PLAN.md）
 t_partial = []
+# 実験 M1（11/20、Gemini の分析から）：NS の通常の探索の1手詰めを、残りの深さ1の局面だけで調べる（読みは変わる。baseline/mate1ns_20261120/PLAN.md）
+ns_mate1d1 = []
+# 11/21 既定にした（実験 M1 の MA：NsOff=16384 と同じ読み。直接 1,792局 53.5% で H1、AobaNNUE 相手 +1.0ポイント）：NS の通常の探索で1手詰めを調べない
+ns_nomate1 = []
+# 実験 速さ7（11/20、Gemini の分析から。読みは変わらない。baseline/speed7_20261120/PLAN.md）：v_accops 差分更新で、評価が要るときだけ行の一覧を作りレジスタ8本でまとめて足し引き／v_legalfast 王手でないとき、玉の手と玉の線上の駒の手以外は王手放置の判定を省く。11/21 v_legalfast と v_bbchk を既定にした（合わせて速さ 1.031倍、読みは一致。v_accops は 1.018 で届かず）
+v_accops = []
+v_legalfast = []
 # 実験B4：20エポックで学習したネット（nets/b4.nn）を埋め込む
 net_b4 = []
 # 実験B5：水匠10 の教師データを加えて学習したネット（nets/b5.nn）を埋め込む
