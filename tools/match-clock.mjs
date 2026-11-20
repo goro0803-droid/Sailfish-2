@@ -12,20 +12,22 @@ const RULES = resolve(import.meta.dirname, '../../ShogiArena/src/js/shogi.js');
 const { Position, START_SFEN, moveToUsi, PAWN } = await import(pathToFileURL(RULES).href);
 
 const [pathA, pathB, gamesArg = '20', bankArg = '300000', incArg = '10000', parArg = '2', ...extraArgs] = process.argv.slice(2);
-let jsonPath, seedOffset = 0;
+// --byoyomi（11/20 から）：秒読みのミリ秒。付けると加算は 0 にすること。持ち時間は秒読みを超えた分だけ減り、0 未満で時間切れ
+let jsonPath, seedOffset = 0, BYO = 0;
 for (let i = 0; i < extraArgs.length; i += 2) {
   const key = extraArgs[i], value = extraArgs[i + 1];
   if (value === undefined) throw new Error('Missing optional argument value');
   if (key === '--json') jsonPath = value;
   else if (key === '--seed-offset' && /^\d+$/.test(value) && Number.isSafeInteger(Number(value))) seedOffset = Number(value);
-  else throw new Error('Optional arguments: --json result.json --seed-offset nonnegative_integer');
+  else if (key === '--byoyomi' && /^\d+$/.test(value) && Number(value) > 0) BYO = Number(value);
+  else throw new Error('Optional arguments: --json result.json --seed-offset nonnegative_integer --byoyomi positive_ms');
 }
 if (!pathA || !pathB) {
   console.log('使い方: node tools/match.mjs <エンジンA> <エンジンB> [対局数] [1手のミリ秒] [並列数]');
   process.exit(1);
 }
 const GAMES = +gamesArg, BANK = +bankArg, INC = +incArg, PAR = +parArg;
-if (![GAMES,BANK,INC,PAR].every(Number.isSafeInteger) || GAMES<=0 || GAMES%2 || BANK<=0 || INC<0 || PAR<=0) throw Error('Invalid clock match arguments');
+if (![GAMES,BANK,INC,PAR].every(Number.isSafeInteger) || GAMES<=0 || GAMES%2 || (BYO ? BANK<0 || INC!==0 : BANK<=0) || INC<0 || PAR<=0) throw Error('Invalid clock match arguments');
 const MAX_PLY = 320;
 
 // エンジンの指定は「パス|オプション=値,オプション=値」の形でもよい（例: suisho.exe|Threads=1,NodesLimit=3000）
@@ -70,7 +72,7 @@ class Engine {
     this.lastInfo = null;
     const waiting = this.wait('bestmove');
     const start = performance.now();
-    this.send('go btime '+Math.floor(clocks[0])+' wtime '+Math.floor(clocks[1])+' binc '+INC+' winc '+INC);
+    this.send('go btime '+Math.floor(clocks[0])+' wtime '+Math.floor(clocks[1])+(BYO ? ' byoyomi '+BYO : ' binc '+INC+' winc '+INC));
     const line = await waiting;
     return {move:line.split(/\s+/)[1],elapsedMs:performance.now()-start,info:this.lastInfo};
   }
@@ -112,7 +114,7 @@ async function playGame(black, white, opening) {
     if (rep >= 4) return [0.5, '千日手', trace];
     const before = clocks[side];
     const {move:u,elapsedMs,info} = await eng[side].think(moves,clocks);
-    clocks[side] -= elapsedMs;
+    clocks[side] -= BYO ? Math.max(0, elapsedMs - BYO) : elapsedMs;
     const row={ply:moves.length+1,side,move:u,beforeMs:before,elapsedMs,afterMs:clocks[side],info};
     trace.push(row);
     if (clocks[side]<0) return [side===0 ? 0 : 1,'時間切れ',trace];

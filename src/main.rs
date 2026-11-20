@@ -164,6 +164,14 @@ impl Engine {
                     self.nodes_limit = v;
                 }
             }
+            // 実験 NS の SPSA（cargo の機能 ns_tune）：探索の値 NT_0〜NT_15（中身は search_ns.rs の NT_DEFAULT）
+            n if cfg!(feature = "ns_tune") && n.starts_with("NT_") => {
+                if let (Ok(i), Ok(v)) = (n[3..].parse::<usize>(), value.parse::<i32>()) {
+                    if i < sailfish2::search::NS_TUNE.len() {
+                        sailfish2::search::NS_TUNE[i].store(v, Ordering::Relaxed);
+                    }
+                }
+            }
             // 実験SPSA（cargo の機能 tune）：探索の値 T_0〜T_15（中身は search.rs の TUNE_DEFAULT）
             n if cfg!(feature = "tune") && n.starts_with("T_") => {
                 if let (Ok(i), Ok(v)) = (n[2..].parse::<usize>(), value.parse::<i32>()) {

@@ -303,6 +303,8 @@ pub struct Searcher {
     /// 実験 t_fall（11/10）：今の局面の手数（USI の側で入れる）と、前の思考の（手数, 最後の評価）
     pub game_ply: usize,
     last_root: Option<(usize, i32)>,
+    /// 実験 PI（cargo の機能 t_partial）：今の反復で、読み終えて α を上回った根の手（反復の初めに消す）
+    pub(crate) root_partial: Move,
     /// 有効な探索の改良（F_ のビット）
     feat: u32,
     /// 各 ply の静的評価値（王手を受けているときは -INF）
@@ -605,6 +607,8 @@ impl TacticalThreats {
 /// 実験 NS（11/17）：作り直した探索（cargo の機能 ns のときだけ使う）
 #[path = "search_ns.rs"]
 mod ns;
+/// 実験 NS の SPSA（cargo の機能 ns_tune）：探索の値（USI の隠しオプション NT_0〜NT_15）
+pub use ns::NS_TUNE;
 
 impl Searcher {
     /// 根の局面を読む（cargo の機能 ns なら作り直した探索、そうでなければ今までの探索）
@@ -655,6 +659,7 @@ impl Searcher {
             helper_idx: 0,
             game_ply: 0,
             last_root: None,
+            root_partial: MOVE_NONE,
             feat: 0,
             static_evals: [-INF; MAX_PLY + 2],
             ecache: vec![(0, i32::MIN); 1 << ECACHE_BITS],
@@ -1041,6 +1046,9 @@ impl Searcher {
         self.stopped = false;
         self.killers = [[MOVE_NONE; 2]; MAX_PLY + 2];
         self.ns.off = NS_OFF.load(Ordering::Relaxed);
+        if cfg!(feature = "ns_tune") {
+            self.ns.red = ns::red_table();
+        }
         self.ns.nmp_min_ply = 0;
         self.ns.dext[0] = 0;
         let is_main = self.helper_idx == 0;
@@ -1067,6 +1075,7 @@ impl Searcher {
             let prior_score = prev_score;
             let prior_best = best;
             self.sel_depth = 0;
+            self.root_partial = MOVE_NONE;
 
             // アスピレーションウィンドウ
             let mut delta = tp(13);
@@ -1095,6 +1104,14 @@ impl Searcher {
             };
 
             if self.stopped && depth > 1 {
+                // 実験 PI（cargo の機能 t_partial）：止めた反復で、読み終えて前の手より良いと分かった根の手があれば、それを指す
+                if cfg!(feature = "t_partial") && is_main && self.multipv <= 1
+                    && self.root_partial != MOVE_NONE && self.root_partial != best
+                {
+                    ponder = if self.pv_len[0] > 1 && self.pv[0] == self.root_partial { self.pv[1] } else { MOVE_NONE };
+                    println!("info string partial depth {} {} -> {}", depth, move_to_usi(best), move_to_usi(self.root_partial));
+                    best = self.root_partial;
+                }
                 break;
             }
             prev_score = score;

@@ -31,6 +31,37 @@ pub(super) const NS_CONT: u32 = 262144;
 pub(super) const NS_QFUT: u32 = 524288;
 pub(super) const NS_TTSTAT: u32 = 1048576;
 
+/// 実験 NS の SPSA（cargo の機能 ns_tune）：探索の値。USI の隠しオプション NT_0〜NT_15 で変える。
+/// 機能が無効なら既定の値（＝ 11/17 の NS と同じ読み）を使う。
+/// 0 RFP の幅（1手あたり）／1 razoring の幅（深さ²あたり）／2 ProbCut の幅／3 LMP の手数（百分率）／
+/// 4 駒取りの futility の基本の幅／5 同（1手あたり）／6 駒取り・成りの SEE の幅（1手あたり）／
+/// 7 継続ヒストリーによる省略の境目（1手あたり）／8 静かな手の futility の基本の幅／9 同（1手あたり）／
+/// 10 静かな手の SEE の幅（深さ²あたり）／11 LMR の表の基本（×100）／12 LMR の表の割り算（×100）／
+/// 13 LMR で cut_node に足す量（1/1024 手）／14 LMR のヒストリーの割り算／15 singular の幅（×10、1手あたり）
+pub const NT_DEFAULT: [i32; 16] = [170, 280, 200, 100, 200, 180, 190, 3500, 120, 130, 25, 50, 210, 1536, 16000, 30];
+pub static NS_TUNE: [AtomicI32; 16] = [
+    AtomicI32::new(170), AtomicI32::new(280), AtomicI32::new(200), AtomicI32::new(100),
+    AtomicI32::new(200), AtomicI32::new(180), AtomicI32::new(190), AtomicI32::new(3500),
+    AtomicI32::new(120), AtomicI32::new(130), AtomicI32::new(25), AtomicI32::new(50),
+    AtomicI32::new(210), AtomicI32::new(1536), AtomicI32::new(16000), AtomicI32::new(30),
+];
+
+#[inline]
+fn nt(i: usize) -> i32 {
+    if cfg!(feature = "ns_tune") { NS_TUNE[i].load(Ordering::Relaxed) } else { NT_DEFAULT[i] }
+}
+
+/// LMR で浅くする量の表（1/1024 手）[深さ][何手目]
+pub(super) fn red_table() -> Vec<i32> {
+    let (base, div) = (nt(11) as f64 / 100.0, nt(12) as f64 / 100.0);
+    (0..64 * 64)
+        .map(|i| {
+            let (d, m) = ((i / 64) as f64, (i % 64) as f64);
+            if d < 1.0 || m < 1.0 { 0 } else { (1024.0 * (base + d.ln() * m.ln() / div)) as i32 }
+        })
+        .collect()
+}
+
 /// 手の並べ方の点数の帯
 const SC_TT: i32 = i32::MAX;
 /// 駒取り・成り（まだ SEE を調べていない）。GOOD＋点数（点数は 0〜5千万未満）
@@ -73,16 +104,7 @@ pub(super) struct NsTables {
 
 impl NsTables {
     pub(super) fn new(on: bool) -> NsTables {
-        let red = if on {
-            (0..64 * 64)
-                .map(|i| {
-                    let (d, m) = ((i / 64) as f64, (i % 64) as f64);
-                    if d < 1.0 || m < 1.0 { 0 } else { (1024.0 * (0.5 + d.ln() * m.ln() / 2.1)) as i32 }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let red = if on { red_table() } else { Vec::new() };
         NsTables {
             main: if on { vec![0; MAIN_SIZE] } else { Vec::new() },
             cont: if on { vec![0; PT * PT] } else { Vec::new() },
@@ -355,7 +377,7 @@ impl Searcher {
 
         if !pv_node && !in_check && excluded == MOVE_NONE && !root {
             // razoring：評価が α よりかなり低ければ、静止探索で確かめて打ち切る
-            if off & NS_RAZOR == 0 && eval < alpha - 450 - 280 * depth * depth {
+            if off & NS_RAZOR == 0 && eval < alpha - 450 - nt(1) * depth * depth {
                 let v = self.ns_qsearch(pos, alpha - 1, alpha, ply, 0);
                 if self.stopped { return 0; }
                 if v < alpha && v.abs() < MATE_BOUND {
@@ -364,7 +386,7 @@ impl Searcher {
             }
             // 静的評価による打ち切り
             if off & NS_RFP == 0 && depth < 9 && eval.abs() < MATE_BOUND
-                && eval - 170 * (depth - i32::from(improving)) >= beta
+                && eval - nt(0) * (depth - i32::from(improving)) >= beta
             {
                 ts!(self, rfp);
                 tsd!(self, d_rfp, d0);
@@ -403,7 +425,7 @@ impl Searcher {
                 }
             }
             // ProbCut：β をはっきり超えそうな駒取りを、静止探索 → 4手浅い探索で確かめる
-            let pc_beta = beta + 200 - 60 * i32::from(improving);
+            let pc_beta = beta + nt(2) - 60 * i32::from(improving);
             if off & NS_PROBCUT == 0 && depth >= 5 && beta.abs() < MATE_BOUND
                 && !(tt_entry.is_some() && tt_depth >= depth - 3 && tt_score < pc_beta)
             {
@@ -454,7 +476,7 @@ impl Searcher {
         let mut caps_tried = [MOVE_NONE; 32];
         let mut n_caps = 0;
         let tt_capture = tt_move != MOVE_NONE && !mv_is_drop(tt_move) && pos.board[mv_to(tt_move)] != 0;
-        let lmp_limit = (3 + depth * depth) / (2 - i32::from(improving));
+        let lmp_limit = ((3 + depth * depth) * nt(3) / 100) / (2 - i32::from(improving));
         let us = pos.side;
 
         let mut next = 0;
@@ -483,11 +505,11 @@ impl Searcher {
                 if !quiet || gives_check {
                     if !gives_check && off & NS_CAPFUT == 0 && lmr_depth < 7 {
                         let ch = if is_cap { self.ns.cap[pidx * 16 + type_of(pos.board[to]) as usize] as i32 } else { 0 };
-                        if raw + 200 + 180 * lmr_depth + gain(pos, m) + ch / 16 <= alpha {
+                        if raw + nt(4) + nt(5) * lmr_depth + gain(pos, m) + ch / 16 <= alpha {
                             continue;
                         }
                     }
-                    if off & NS_SEE == 0 && kind != K_GOOD && !self.exchange_ge(pos, m, -190 * depth) {
+                    if off & NS_SEE == 0 && kind != K_GOOD && !self.exchange_ge(pos, m, -nt(6) * depth) {
                         continue;
                     }
                 } else {
@@ -496,17 +518,17 @@ impl Searcher {
                         continue;
                     }
                     let ch = self.ns_cont(pidx, ply);
-                    if off & NS_CHP == 0 && lmr_depth < 6 && ch < -3500 * depth {
+                    if off & NS_CHP == 0 && lmr_depth < 6 && ch < -nt(7) * depth {
                         continue;
                     }
                     let hist = ch + 2 * self.ns.main[main_idx(us, m)] as i32;
                     let ld = lmr_depth + hist / 16000;
-                    if off & NS_FUT == 0 && ld < 10 && raw + 120 + 130 * ld <= alpha {
+                    if off & NS_FUT == 0 && ld < 10 && raw + nt(8) + nt(9) * ld <= alpha {
                         ts!(self, fut);
                         continue;
                     }
                     let ld = ld.max(0);
-                    if off & NS_SEE == 0 && !self.exchange_ge(pos, m, -25 * ld * ld) {
+                    if off & NS_SEE == 0 && !self.exchange_ge(pos, m, -nt(10) * ld * ld) {
                         continue;
                     }
                 }
@@ -521,7 +543,7 @@ impl Searcher {
                 let legal = prof!(self, 3, pos.do_move_legal(m));
                 if legal {
                     prof!(self, 4, pos.undo_move());
-                    let sbeta = tt_score - 3 * depth;
+                    let sbeta = tt_score - nt(15) * depth / 10;
                     self.singular_verifying = true;
                     let v = self.ns_search(pos, sbeta - 1, sbeta, (depth - 1) / 2, ply, cut_node, m);
                     self.singular_verifying = false;
@@ -572,13 +594,13 @@ impl Searcher {
                     let mut r = r_base;
                     if off & NS_LMR_ADJ == 0 {
                         if pv_node { r -= 1024; }
-                        if cut_node { r += 1536; }
+                        if cut_node { r += nt(13); }
                         if tt_capture { r += 1024; }
                         if gives_check { r -= 1024; }
                         if kind == K_KILLER { r -= 768; }
                         if quiet {
                             let ss = 2 * self.ns.main[main_idx(us, m)] as i32 + self.ns_cont(pidx, ply) - 3000;
-                            r -= ss * 1024 / 16000;
+                            r -= ss * 1024 / nt(14);
                         }
                     }
                     let hi = new_depth.max(1) + i32::from(pv_node);
@@ -617,6 +639,9 @@ impl Searcher {
                 best = v;
                 if v > alpha {
                     best_move = m;
+                    if cfg!(feature = "t_partial") && root && excluded == MOVE_NONE {
+                        self.root_partial = m;
+                    }
                     if pv_node && excluded == MOVE_NONE {
                         self.update_pv(ply, m);
                     }

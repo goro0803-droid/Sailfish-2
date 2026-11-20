@@ -36,7 +36,7 @@ panic = "abort"
 # 11/20 から、実験NH の net_nh（手作りの評価を使わないネット、nets/nh.nn）も既定（ユーザーの判断 11/20）。読みは変わる。
 # NS の上で、直接対局の SPRT（1スレッド・10秒＋0.2秒）2,240局で 53.0%（H1）、AobaNNUE 相手・1手1秒 各800局で +4.0ポイント、
 # 4スレッド・60秒＋2秒の SPRT 400局で 51.6%（上限、基準は通過）（baseline/ns_search_20261117/PLAN.md の N6・N8）。
-default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache", "f_lmr4", "ns", "net_nh"]
+default = ["perpetual_check", "nyugyoku", "book", "time_unstable", "s_check", "s_prune2", "v_prelmp", "h_keep", "v_bb", "v_bbsee", "v_bbgen", "v_ttpf", "v_rep2", "v_kinginc", "v_fcache", "f_lmr4", "ns", "net_nh", "t_partial"]
 # 玉からの相対位置の範囲（既定は ±3）。学習したネットワークとエンジンで同じ範囲にそろえる必要がある。
 kr2 = []
 kr4 = []
@@ -67,6 +67,8 @@ time_bank = []
 t_unst = []
 # 実験 t_fall（11/10）：前の自分の手番より評価が 60点以上低いとき、soft の 1.5 倍（hard まで）まで読む
 t_fall = []
+# 実験 PI（11/20）：11/20 既定にした（直接 960局 55.1% で H1、AobaNNUE 相手 +1.8ポイント）。時間で止めた最後の反復で、読み終えて α を上回った根の手があれば、それを指す（NS の探索だけ。baseline/partial_20261120/PLAN.md）
+t_partial = []
 # 実験B4：20エポックで学習したネット（nets/b4.nn）を埋め込む
 net_b4 = []
 # 実験B5：水匠10 の教師データを加えて学習したネット（nets/b5.nn）を埋め込む
@@ -180,6 +182,8 @@ f_lmr = []
 f_lmr4 = ["f_lmr"]
 # 実験 NS（11/17〜）：探索を作り直した版（src/search_ns.rs）。部品は USI の隠しオプション NsOff で外せる（baseline/ns_search_20261117/PLAN.md）
 ns = []
+# 実験 NS の SPSA（11/18〜）：NS の探索の値を USI の隠しオプション NT_0〜NT_15 で変えられるようにする（既定の値なら読みは同じ）
+ns_tune = ["ns"]
 node_dump = []
 # 診断：探索の処理ごとの CPU のクロック数を数え、思考の終わりに info string prof で出す（主スレッドの分だけ。測る分だけ遅くなる）
 prof = []

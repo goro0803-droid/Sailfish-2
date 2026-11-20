@@ -11,7 +11,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const cfg = JSON.parse(readFileSync(process.argv[2], 'utf8'));
-const { out, A, B, bankMs, incMs, par = 8, seed, chunk = 64, elo0 = 0, elo1 = 10, alpha = 0.05, beta = 0.05, maxGames = 2000 } = cfg;
+// byoMs（11/20 から、省略可）：秒読みのミリ秒。付けると match-clock.mjs に --byoyomi で渡す（incMs は 0、bankMs は 0 でもよい）
+const { out, A, B, bankMs, incMs, byoMs = 0, par = 8, seed, chunk = 64, elo0 = 0, elo1 = 10, alpha = 0.05, beta = 0.05, maxGames = 2000 } = cfg;
 if (chunk % 2 || maxGames % chunk) throw new Error('chunk は偶数で、maxGames を割り切れること');
 mkdirSync(out, { recursive: true });
 const log = s => { const line = `${new Date().toLocaleString('ja-JP')} ${s}`; console.log(line); appendFileSync(join(out, 'sprt.log'), line + '\n', 'utf8'); };
@@ -62,12 +63,12 @@ function report() {
 
 if (process.argv.includes('--summary')) { report(); process.exit(0); }
 
-log(`開始（pid ${process.pid}）: A=${A}  B=${B}  ${bankMs}ms＋${incMs}ms  ${par}局同時  SPRT [${elo0}, ${elo1}] α=${alpha} β=${beta} 上限${maxGames}局`);
+log(`開始（pid ${process.pid}）: A=${A}  B=${B}  ${bankMs}ms＋${incMs}ms${byoMs ? `＋秒読み${byoMs}ms` : ''}  ${par}局同時  SPRT [${elo0}, ${elo1}] α=${alpha} β=${beta} 上限${maxGames}局`);
 for (let k = 1; k <= maxGames / chunk; k++) {
   const f = join(out, `part${k}.json`);
   if (!existsSync(f)) {
     const rr = spawnSync(process.execPath, ['--no-warnings', 'tools/match-clock.mjs', A, B, String(chunk), String(bankMs), String(incMs), String(par),
-      '--json', f, '--seed-offset', String(seed + (k - 1) * chunk / 2)], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 28 });
+      '--json', f, '--seed-offset', String(seed + (k - 1) * chunk / 2), ...(byoMs ? ['--byoyomi', String(byoMs)] : [])], { cwd: ROOT, encoding: 'utf8', maxBuffer: 1 << 28 });
     if (rr.status !== 0 || !existsSync(f)) { log(`part${k} 失敗: ${(rr.stderr || '').slice(-500)}`); process.exit(1); }
   }
   const { n, L } = report();
