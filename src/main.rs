@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const ENGINE_NAME: &str = "Sailfish 3.2";
+const ENGINE_NAME: &str = "Sailfish 3.3";
 const ENGINE_AUTHOR: &str = "dax";
 const STACK_SIZE: usize = 256 * 1024 * 1024;
 
