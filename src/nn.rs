@@ -1302,6 +1302,7 @@ fn set_global(net: Network) {
 /// 実行ファイルに埋め込んだ標準のネットワーク（nets/default.nn。11/10 から B5 に戻した。11/7〜11/10 は段階6の L64H だった）。
 /// cargo の機能 net_b4 なら実験B4（20エポック）の、net_b5 なら実験B5（水匠10 のデータを追加）の、
 /// net_nh なら実験NH（土台を駒の損得だけにして、手作りの評価を使わない）のネットを埋め込む。
+/// 11/24 から nets/nh.nn は実験 T1 の KPT（同じ型を tanuki 2024 の教師データ＋水匠10 で学び直したもの。baseline/tanuki_20261123/PLAN.md）。
 /// net_l64h・net_l64m は段階6の実験（第2層を 64 に。土台はそれぞれ手作りの評価・駒の損得だけ）のネットを埋め込む。
 #[cfg(not(any(feature = "net_b4", feature = "net_b5", feature = "net_nh", feature = "net_l64h", feature = "net_l64m", feature = "net_ls4")))]
 static DEFAULT_NET: &[u8] = include_bytes!("../nets/default.nn");
