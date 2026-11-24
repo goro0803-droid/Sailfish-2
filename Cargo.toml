@@ -1,6 +1,6 @@
 [package]
 name = "sailfish2"
-version = "3.3.0"
+version = "3.4.0"
 authors = ["dax"]
 license = "MIT"
 description = "USI shogi engine"
